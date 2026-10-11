@@ -253,3 +253,118 @@ def new_deal(*, deal_no: int, rng: np.random.Generator, lead_mode: str = "six_si
         scores=list(scores or [0, 0]),
         forced_leader_six_six=(lead_mode == "six_six"),
     )
+
+
+@dataclass(frozen=True)
+class DealOutcome:
+    """The result of one finished deal.
+
+    ``points`` is always the number of points banked by the winning team (the
+    sum of the two opponents' remaining pips); the environment applies the
+    differential/banked reward mode, never the engine.
+    """
+
+    winner_team: int | None
+    points: int
+    blocked: bool
+    void: bool
+    reason: str                    # "emptied" | "blocked" | "void_tie" | "wall"
+    winning_seat: int | None = None
+
+
+def deal_outcome(state: GameState) -> DealOutcome:
+    """Score a finished deal under the project's house rules.
+
+    * hand emptied: the empty-handed seat's team banks the sum of the two
+      opponents' remaining pips;
+    * blocked, unique (or same-team) minimum: the fewest-pips seat's team banks
+      the sum of the two opponents' remaining pips;
+    * blocked, minimum shared across both teams: void, nobody scores.
+    """
+    emptied = [i for i, h in enumerate(state.hands) if not h]
+    if emptied:
+        seat = emptied[0]
+        team = TEAM_OF_SEAT[seat]
+        points = sum(state.pips(o) for o in OPPONENTS_OF_SEAT[seat])
+        return DealOutcome(team, points, False, False, "emptied", seat)
+    if not state.blocks() and len(state.table) < NUM_TILES:
+        raise ValueError("deal_outcome called on a deal that is neither emptied nor blocked")
+    pips = [state.pips(i) for i in range(SEATS)]
+    fewest = min(pips)
+    tied = [i for i in range(SEATS) if pips[i] == fewest]
+    teams = {TEAM_OF_SEAT[i] for i in tied}
+    if len(teams) > 1:
+        return DealOutcome(None, 0, True, True, "void_tie", None)
+    winner_seat = tied[0]
+    team = TEAM_OF_SEAT[winner_seat]
+    points = sum(state.pips(o) for o in OPPONENTS_OF_SEAT[winner_seat])
+    return DealOutcome(team, points, True, False, "blocked", winner_seat)
+
+
+def next_leader(state: GameState, outcome: DealOutcome) -> int | None:
+    """Seat that leads the next deal, or ``None`` for a void redeal.
+
+    A void deal forces a redeal led by the ``[6|6]`` holder (``None``); every
+    other deal is led by its winner.
+    """
+    if outcome.void:
+        return None
+    return outcome.winning_seat
+
+
+def redeal_after_void(state: GameState) -> GameState:
+    """Reshuffle a void deal, keeping the match scores; ``[6|6]`` holder leads."""
+    return new_deal(deal_no=state.deal_no + 1, rng=state.rng, lead_mode="six_six",
+                    scores=list(state.scores))
+
+
+class Match:
+    """A match to ``target`` points; drives deals through per-seat policies."""
+
+    def __init__(self, target: int = 100, seed: int = 0) -> None:
+        self.target = target
+        self.seed = seed
+        self.rng = np.random.default_rng(seed)
+        self.deals: list[DealOutcome] = []
+        self.scores: list[int] = [0, 0]
+        self.deal_no = 1
+        self.finished = False
+        self.winner_team: int | None = None
+
+    def reset(self) -> None:
+        self.__init__(target=self.target, seed=self.seed)
+
+    def play_deal(self, policy_by_seat: dict[int, Callable[[GameState, int], int]]) -> DealOutcome:
+        """Play one deal to the end and apply scoring.
+
+        ``policy_by_seat`` maps seat -> callable ``(state, seat) -> action`` that
+        returns a legal tile id. A void deal is recorded, redealt and the same
+        loop continues until a non-void outcome scores. Raises ``ValueError`` if
+        a policy returns an illegal action.
+        """
+        state = new_deal(deal_no=self.deal_no, rng=self.rng, lead_mode="six_six",
+                         scores=list(self.scores))
+        while True:
+            while not state.is_terminal():
+                seat = state.turn
+                legal = state.legal_actions(seat)
+                if not legal:
+                    state.pass_turn(seat)
+                    continue
+                action = int(policy_by_seat[seat](state, seat))
+                if action not in legal:
+                    raise ValueError(f"policy for seat {seat} returned illegal action {action}")
+                state.play(seat, action)
+            outcome = deal_outcome(state)
+            if not outcome.void:
+                break
+            self.deals.append(outcome)
+            state = redeal_after_void(state)
+            self.deal_no += 1
+        self.deals.append(outcome)
+        self.scores[outcome.winner_team] += outcome.points
+        self.deal_no += 1
+        if max(self.scores) >= self.target:
+            self.finished = True
+            self.winner_team = 0 if self.scores[0] >= self.scores[1] else 1
+        return outcome

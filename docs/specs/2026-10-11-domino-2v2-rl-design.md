@@ -96,6 +96,8 @@ reported.
   (`+` sum of the opponents' remaining pips, `0` on a void deal, `0` for every non-terminal
   transition). Rewards are **raw points, undiscounted, no shaping** — the assignment's
   convergence metric (total reward per episode) is then directly "points per deal".
+  Reward mode is configurable (`differential` default | `banked`); the environment applies it,
+  the engine always reports the points banked by the winning team (see addendum A).
 * **Discount**: `gamma = 0.99` by default (exposed as a CLI flag; 1.0 is defensible for a
   finite-horizon episodic task and is discussed in the report). SB3's advantage
   normalisation handles the reward magnitude (returns are order 10-60 points), which is why
@@ -489,6 +491,7 @@ keep checkpoints every 500 k steps so any stopping point is usable.
 * A3 architecture: custom set encoder vs a default SB3 MLP of similar size.
 * A4 `gamma` 0.99 vs 1.0.
 * A5 opponent mixing within a deal.
+* A6 reward mode: `differential` (default) vs `banked`.
 Not to be run unless the training budget allows; the harness supports them from day one
 because they are config values, not code branches.
 
