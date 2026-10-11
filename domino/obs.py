@@ -18,7 +18,8 @@ Layout (start:stop, ``me`` = acting seat)::
     175:179 tile count in each relative seat's hand / 7
     179:183 one-hot: which relative seat led this deal
     183:184 1 if I am the deal leader
-    184:191 per pip value v: 1 if any unseen tile still carries v
+    184:191 per pip value v: 1 if any tile outside my hand and the table
+            (i.e. held by another seat) carries v — per-pip-value liveness
     191:192 1 if the board is empty (I am leading right now)
 
 No gymnasium, torch or pygame is imported here: numpy and the engine only.
@@ -116,10 +117,15 @@ def encode(state: GameState, seat: int) -> np.ndarray:
     if state.leader == seat:
         vector[AM_LEADER.start] = 1.0
 
-    # 184:191 — per pip value, whether any unseen tile still carries it.
-    unseen_tiles = state.unseen_tiles()
-    if unseen_tiles:
-        idx = np.fromiter(unseen_tiles, dtype=np.intp, count=len(unseen_tiles))
+    # 184:191 — per pip value, whether any still-unseen tile carries it.
+    # "Unseen" = not in my hand and not on the table (i.e. in another seat's
+    # hand): with no boneyard this is the complement of hand | table, and is
+    # deterministic public information (spec section 10: live[v] = count of
+    # such tiles from 168, minus my hand, minus the table).
+    seen = set(state.hands[seat]) | set(state.table)
+    idx = np.fromiter((t for t in ALL_TILE_IDS if t not in seen),
+                      dtype=np.intp)
+    if idx.size:
         live = _tile_value_matrix()[idx].any(axis=0)
         vector[LIVE_VALUE] = live.astype(np.float32)
 
