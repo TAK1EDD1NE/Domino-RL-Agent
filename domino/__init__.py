@@ -6,6 +6,8 @@ the rules layer, and the learning code that builds on top of it.
 """
 from __future__ import annotations
 
+from .engine import GameState
+
 __version__ = "0.1.0"
 
-__all__ = ["__version__"]
+__all__ = ["__version__", "GameState"]
