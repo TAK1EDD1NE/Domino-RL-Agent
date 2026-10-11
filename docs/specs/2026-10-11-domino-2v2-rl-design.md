@@ -320,14 +320,18 @@ Scoring of each legal move (higher is better), with default weights:
 
 | term | weight | intent |
 |------|--------|--------|
-| pips shed (value of the tile) | +1.0 | get heavy tiles out of your hand, they are what you lose on a block |
-| kills a value (after the move, that end's value is dead table-wide) | +3.0 | strangle the table, force passes |
-| end value the opponents are short of | +2.0 | make them draw from a shrinking set |
+| pips shed (value of the tile) | +0.5 | get heavy tiles out of your hand, they are what you lose on a block |
+| kills a value (after the move, that end's value is dead table-wide) | +9.0 | strangle the table, force passes |
+| end value the opponents are short of | +6.0 | make them draw from a shrinking set |
 | keeps my doubles in hand | +0.5 | doubles are the most flexible tiles, useful as end-switchers later |
 | protects the partner (does not open a value the partner is short of) | +1.5 | team play: do not hand the partner an impossible end |
 | reduces my expected loss on a future block (`my_pips` vs table minimum) | +2.0 | if a block looks close, become the lowest-pip player |
 | leading a value I hold a duplicate of | +1.5 | keeps both ends available |
 | forced opening `[6|6]` | n/a | the only legal move in deal 1's lead |
+
+These weights were chosen by the documented sweep `tools/sweep_rule_weights.py` (coordinate
+ascent against a random opponent on evaluation seeds disjoint from the win-rate gate's), not
+by hand; the previous hand-chosen values were `+1.0 / +3.0 / +2.0 / +0.5 / +1.5 / +2.0 / +1.5`.
 
 Block-awareness: if `sum(live) <= 12` or the pass streak is ≥ 2, the "reduce my expected loss"
 and "kills a value" terms are doubled, because the deal is likely to end blocked and the
@@ -492,6 +496,7 @@ keep checkpoints every 500 k steps so any stopping point is usable.
 * A4 `gamma` 0.99 vs 1.0.
 * A5 opponent mixing within a deal.
 * A6 reward mode: `differential` (default) vs `banked`.
+* A7 rule-bot weight sweep: hand-chosen defaults vs swept weights (tool: tools/sweep_rule_weights.py).
 Not to be run unless the training budget allows; the harness supports them from day one
 because they are config values, not code branches.
 

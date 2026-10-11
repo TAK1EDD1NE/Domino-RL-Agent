@@ -59,10 +59,11 @@ def _decision_states(n: int, seed: int) -> list[tuple[object, int]]:
 
 
 def test_rule_weights_defaults_match_spec_table():
+    """Defaults are the swept weights pinned in spec section 10 (tools/sweep_rule_weights.py)."""
     w = RuleWeights()
-    assert w.pips_shed == 1.0
-    assert w.kills_value == 3.0
-    assert w.opp_short_end == 2.0
+    assert w.pips_shed == 0.5
+    assert w.kills_value == 9.0
+    assert w.opp_short_end == 6.0
     assert w.keep_doubles == 0.5
     assert w.protect_partner == 1.5
     assert w.block_economics == 2.0
@@ -193,3 +194,22 @@ def test_rule_bot_beats_random_over_300_deals():
         f"mean rule-bot win rate {mean:.4f} over {len(rates)} seeds "
         f"(SD {spread:.4f}) is below 0.55; per-seed {per_seed}"
     )
+
+
+def test_sweep_evaluation_seeds_are_disjoint_from_the_gate_seeds():
+    """The weight sweep must not fit its weights to the seeds this gate scores on."""
+    from tools.sweep_rule_weights import DEFAULT_SEEDS
+
+    assert len(set(DEFAULT_SEEDS)) == len(DEFAULT_SEEDS)
+    assert set(DEFAULT_SEEDS).isdisjoint(_WIN_RATE_SEEDS)
+
+
+def test_sweep_evaluation_helper_is_deterministic():
+    """``evaluate`` is a pure function of its ``(weights, seeds, deals)`` arguments."""
+    from tools.sweep_rule_weights import evaluate
+
+    weights = RuleWeights()
+    seeds = (1000, 1001)
+    first = evaluate(weights, seeds, deals=40)
+    second = evaluate(weights, seeds, deals=40)
+    assert first == second

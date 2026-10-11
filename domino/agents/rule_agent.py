@@ -29,11 +29,15 @@ SHORT_SUPPLY = 2               # live[v] <= 2 -> the other seats are thin on v
 
 @dataclass
 class RuleWeights:
-    """Named weights of the spec section 10 scoring table (defaults as specified)."""
+    """Named weights of the spec section 10 scoring table.
 
-    pips_shed: float = 1.0          # shed heavy tiles: they are what you lose on a block
-    kills_value: float = 3.0        # play so an open end value is dead table-wide
-    opp_short_end: float = 2.0      # leave an end value the opponents are short of
+    The defaults are the best weights found by the documented sweep
+    ``tools/sweep_rule_weights.py`` (spec section 10), not hand-chosen values.
+    """
+
+    pips_shed: float = 0.5          # shed heavy tiles: they are what you lose on a block
+    kills_value: float = 9.0        # play so an open end value is dead table-wide
+    opp_short_end: float = 6.0      # leave an end value the opponents are short of
     keep_doubles: float = 0.5       # do not spend a double unless it pays off
     protect_partner: float = 1.5    # do not open a value the partner is short of
     block_economics: float = 2.0    # become the lowest-pip player before a block
