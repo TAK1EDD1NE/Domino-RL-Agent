@@ -344,16 +344,26 @@ class Match:
     def reset(self) -> None:
         self.__init__(target=self.target, seed=self.seed)
 
-    def play_deal(self, policy_by_seat: dict[int, Callable[[GameState, int], int]]) -> DealOutcome:
+    def play_deal(
+        self,
+        policy_by_seat: dict[int, Callable[[GameState, int], int]],
+        action_decoder: Callable[[int], tuple[int, int]] | None = None,
+    ) -> DealOutcome:
         """Play one deal to the end and apply scoring.
 
         ``policy_by_seat`` maps seat -> callable ``(state, seat) -> action`` that
-        returns a legal tile id. The lead follows the spec: deal 1 and any
+        returns a legal action. The lead follows the spec: deal 1 and any
         post-void redeal force the ``[6|6]`` holder to open, while every later
         deal is opened with a free lead by the previous deal's winner. A void
         deal is recorded, redealt and the same loop continues until a non-void
         outcome scores. Raises ``ValueError`` if a policy returns an illegal
         action.
+
+        ``action_decoder`` optionally maps whatever a policy returns into a
+        ``(tile_id, end_index)`` placement -- pass
+        :func:`domino.masks.decode_action` for agents whose action space is the
+        56-dim ``(tile, end)`` encoding. Without it the return value is treated
+        as a tile id and the placement falls back to the first legal end.
         """
         if self._pending_leader is None:
             state = new_deal(deal_no=self.deal_no, rng=self.rng, lead_mode="six_six",
@@ -369,9 +379,18 @@ class Match:
                     state.pass_turn(seat)
                     continue
                 action = int(policy_by_seat[seat](state, seat))
-                if action not in legal:
-                    raise ValueError(f"policy for seat {seat} returned illegal action {action}")
-                state.play(seat, action)
+                if action_decoder is None:
+                    if action not in legal:
+                        raise ValueError(f"policy for seat {seat} returned illegal action {action}")
+                    state.play(seat, action)
+                else:
+                    tid, end = action_decoder(action)
+                    if tid not in legal:
+                        raise ValueError(
+                            f"policy for seat {seat} returned illegal action {action} "
+                            f"(tile {tid} is not playable)"
+                        )
+                    state.play(seat, tid, end)
             outcome = deal_outcome(state)
             if not outcome.void:
                 break
