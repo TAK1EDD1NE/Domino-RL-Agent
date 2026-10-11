@@ -1,0 +1,22 @@
+# --- Python / uv ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- Training artefacts (regenerable, too large for git) ---
+runs/
+models/
+results/
+*.zip
+*.pt
+*.pth
+events.out.tfevents.*
+
+# --- OS / editors ---
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
