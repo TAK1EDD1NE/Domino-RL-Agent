@@ -6,7 +6,7 @@
 
 **Architecture:** A pure-Python deterministic rules engine (`domino/engine.py`) is wrapped by a Gymnasium env (`domino/env.py`) that exposes the *learner team's* decision points only (opponent seats are played internally by an `OpponentPool`), with a seat-relative 192-dim public-information observation, a masked `Discrete(56)` `(tile, end)` action space and deal-terminal point rewards. `sb3-contrib` `MaskablePPO` trains it with a custom two-tower network. Pygame lives only in `domino/ui/` and is never imported by training code.
 
-**Tech Stack:** Python 3.12, uv (pyproject + uv.lock), gymnasium 1.4, torch 2.5.1+cu121, stable-baselines3 2.7.1, sb3-contrib 2.7.1, pygame 2.6.1, tensorboard 2.21, pandas 3.0, matplotlib 3.11, pytest 9.1.
+**Tech Stack:** Python 3.12, uv (pyproject + uv.lock), gymnasium 1.2.3, torch 2.5.1+cu121, stable-baselines3 2.7.1, sb3-contrib 2.7.1, pygame 2.6.1, tensorboard 2.21, pandas 3.0, matplotlib 3.11, pytest 9.1.
 
 **Spec:** `docs/specs/2026-10-11-domino-2v2-rl-design.md` — the plan implements this spec; executors read both.
 

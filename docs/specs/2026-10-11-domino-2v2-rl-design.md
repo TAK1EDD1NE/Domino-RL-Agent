@@ -403,13 +403,15 @@ Metrics (each justified in the report):
 5. **Mean pips left in hand at deal end** — measures efficiency in the blocked endgame
    specifically.
 6. **Decision latency (ms/action)** — inference cost, relevant for the interactive mode.
-7. **Sample efficiency**: deals needed to reach 50 % win rate vs the rule bot (from the
-   training CSV) — the classic RL comparison axis.
+7. **Sample efficiency** — reframed during implementation: the training log records per-episode
+   reward, not periodic head-to-head results, so this axis is presented as the convergence curve
+   (total reward per episode against steps) in `evaluate.ipynb` rather than as a fabricated
+   win-rate series. Periodic in-training evaluation is listed as future work in section 15.
 
 Outputs: one row per (matchup, seed-batch) in `results/eval_<timestamp>.csv` with a fixed
 schema (matchup, agent_a, agent_b, deals, wins_a, wins_b, win_rate_a, ci_low, ci_high,
-points_per_deal_a, points_per_deal_b, block_rate, void_rate, match_win_rate_a, ms_per_action,
-model_path, seed). `evaluate.ipynb` reads the CSVs and produces: convergence curve (total
+points_per_deal_a, points_per_deal_b, match_win_rate_a, matches_played, block_rate, void_rate,
+mean_pips_left_a, ms_per_action, model_path, seed). `evaluate.ipynb` reads the CSVs and produces: convergence curve (total
 reward per episode with the 100-deal window average), win-rate-vs-training-steps curve, metric
 bar charts with error bars, the metric table, and the ablation table.
 
@@ -455,37 +457,53 @@ started, since the training budget is the owner's decision.
 
 ---
 
-## 14. Training-time estimate
+## 14. Training-time estimate (measured)
 
-Method: measure, do not guess. `tools/bench_throughput.py` measures (a) raw engine
-steps/second single-process, (b) end-to-end learner steps/second with 8 `SubprocVecEnv`
-workers and the league active, (c) PPO update time per rollout batch, (d) GPU utilisation.
-Results go to `runs/benchmark.json` and the table below is replaced by the measured numbers
-before any budget decision is taken.
+Method: measure, do not guess. `tools/bench_throughput.py` measures the raw engine's
+deals/second with no learning machinery, the end-to-end learner steps/second with the real
+vectorised environment (8 `SubprocVecEnv` workers, PPO updates and league opponents), and the
+peak CUDA allocation. Results are written to `runs/benchmark.json`.
 
-Preliminary arithmetic (to be replaced):
+Measured on the development machine (Windows 11, 12 logical CPUs, RTX 3060 Laptop 6 GB,
+torch 2.5.1+cu121, stable-baselines3/sb3-contrib 2.7.1, gymnasium 1.2.3):
 
-* The policy has ~0.3 M parameters and the observation is 192-dim, so gradient work is trivial
-  for an RTX 3060 Laptop (6 GB) — memory is not a constraint and the GPU is not the bottleneck.
-* The bottleneck is the Python env: the engine is pure Python with precomputed legal moves,
-  so expect roughly 3 000-15 000 learner steps/s per worker, i.e. **~25 000-120 000 steps/s
-  aggregate with 8 workers** (minus 10-25 % for league opponent inference).
-* One deal is ~20-30 raw moves, so ~10-14 learner decisions; 1 M learner steps ≈ 80 000-100 000
-  deals.
+| measurement | result |
+|---|---|
+| raw engine, rule/random seats, no gym and no PPO | ~180-208 deals/s, ~4 900-5 600 moves/s (27 moves/deal) |
+| end-to-end learner, 8 envs, rule opponents | 782 steps/s |
+| end-to-end learner, 8 envs, league opponents (snapshots present) | 787-802 steps/s |
+| policy parameters | 251 641 |
+| peak CUDA allocation | in `runs/benchmark.json` |
 
-| steps (learner) | aggregate 25 k steps/s | aggregate 60 k steps/s | aggregate 120 k steps/s |
-|-----------------|------------------------|------------------------|-------------------------|
-| 10 M            | ~6.7 min               | ~2.8 min               | ~1.4 min                |
-| 30 M            | ~20 min                | ~8.3 min               | ~4.2 min                |
-| 100 M           | ~67 min                | ~28 min                | ~14 min                 |
-| 300 M           | ~3.3 h                 | ~83 min                | ~42 min                 |
+The league's opponent inference is **not** the bottleneck: with snapshots on disk the league
+run matches the rule-only run. The gap between the raw engine (~5 600 moves/s) and the learner
+(~800 steps/s, about 100 steps/s per worker) is per-step Python work -- observation encoding,
+the Gymnasium wrapper, the action mask, subprocess IPC and the PPO update.
 
-Convergence expectation: with masking, a 0.3 M-parameter net, terminal deal-level rewards and a
-league of opponents, a first competent policy (beats random decisively, competitive with the
-strong rule bot) should appear in the 10-50 M step range; beating the rule bot reliably is
-plausible in the 50-300 M range. Budget recommendation: plan a 100-300 M step run (~15 min to
-3.3 h at the measured rate, single overnight run at worst) instead of an open-ended one, and
-keep checkpoints every 500 k steps so any stopping point is usable.
+Extrapolated wall clock at the measured ~800 steps/s:
+
+| learner steps | wall clock |
+|---------------|-----------|
+| 10 M | ~3.5 h |
+| 30 M | ~10.5 h |
+| 100 M | ~35 h |
+| 300 M | ~105 h |
+
+**This replaces the preliminary estimate in the first draft of this spec, which assumed
+25 000-120 000 steps/s and was wrong by about two orders of magnitude.** The error was in the
+per-step cost, not in the step budget: the engine is fast, the learning loop is not.
+
+Convergence expectation: with action masking, a 0.25 M-parameter network, terminal deal-level
+rewards and a league of opponents, a first competent policy (decisively better than random,
+competitive with the rule bot) should appear in the 10-50 M step range, and reliably beating
+the rule bot in the 50-300 M range.
+
+Budget recommendation: one 10-30 M step run (~3.5-10.5 h, a single overnight session) with
+checkpoints every 500 k steps, then evaluate; extend only while the win-rate curve is still
+rising. Cheap levers if more throughput is wanted, in order of expected gain: raise `--n-envs`
+towards the core count; cache the observation encoder's per-value liveness table across steps;
+prefer a snapshot-only opponent mix (the rule bot's per-move scoring pass is the most expensive
+per-decision opponent).
 
 ---
 
