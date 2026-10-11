@@ -20,3 +20,6 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+
+# --- SDD scratch workspace (ledger, briefs, review packages) ---
+.superpowers/
