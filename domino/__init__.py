@@ -6,8 +6,13 @@ the rules layer, and the learning code that builds on top of it.
 """
 from __future__ import annotations
 
+import gymnasium
+
 from .engine import GameState, Match
+from .env import DominoEnv
 
 __version__ = "0.1.0"
 
-__all__ = ["__version__", "GameState", "Match"]
+gymnasium.register("Domino2v2-v0", entry_point="domino.env:DominoEnv")
+
+__all__ = ["__version__", "DominoEnv", "GameState", "Match"]
