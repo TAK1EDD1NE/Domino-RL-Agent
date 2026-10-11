@@ -1,0 +1,26 @@
+# Quick smoke preset: a ~4k-step run used by the tests and the pipeline demo.
+# Small rollout buffers so the run finishes in seconds while still exercising the
+# full path (vectorised env, custom policy, callbacks, checkpoints, snapshots).
+run_name: quick_smoke
+total_steps: 4096
+n_envs: 2
+n_steps: 256
+batch_size: 256
+n_epochs: 4
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.2
+ent_coef: 0.01
+learning_rate: 0.0003
+vf_coef: 0.5
+max_grad_norm: 0.5
+target_kl: 0.02
+device: cpu
+checkpoint_every: 2048
+snapshot_every: 1024
+seed: 0
+env:
+  reward_mode: differential
+  opponent: league
+  league_size: 4
+  seed: 0
