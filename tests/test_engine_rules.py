@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from domino.engine import GameState, new_deal, legal_actions, legal_moves
+from domino.engine import GameState, Match, new_deal, legal_actions, legal_moves
 from domino.tiles import ALL_TILE_IDS, SIX_SIX_ID, tile_id, tile_pips, TOTAL_PIPS
 
 
@@ -81,6 +81,21 @@ def test_equal_ends_dedupe_to_one_placement():
     assert legal_moves(s, 0) == [(t, 0)]
 
 
+def test_play_tolerates_wrong_end_for_single_placement_tile():
+    # A tile matching only one open end has a single placement; passing the
+    # other end index is deliberately tolerated and falls back to it.
+    s = new_deal(deal_no=2, rng=np.random.default_rng(0), lead_mode="winner", leader=0)
+    s.table = [tile_id(3, 5)]                    # free lead of [3|5] -> ends 3 and 5
+    s.ends = [3, 5]
+    t = tile_id(1, 3)                            # matches only the 3-end
+    s.hands[0] = [t]
+    s.turn = 0
+    assert legal_moves(s, 0) == [(t, 0)]         # one placement, end index 0
+    s.play(0, t, end=1)                          # wrong end index is ignored, not an error
+    assert s.ends == [1, 5]
+    assert s.table == [tile_id(3, 5), t]
+
+
 def test_pips_conservation_after_every_action():
     s = fresh(11)
     for _ in range(28):
@@ -122,3 +137,33 @@ def test_hand_emptying_is_detected():
     s.turn = 0
     s.play(0, tile_id(1, 2))
     assert s.hand_size(0) == 0
+
+
+def test_second_deal_leader_is_first_deal_winner_with_free_lead():
+    # Spec §2 / §13 test 11: deal 1 forces the [6|6] holder; every later deal
+    # is led by the previous deal's winner with a free lead.
+    m = Match(target=100, seed=5)
+    opens = []
+
+    def policy(st, seat):
+        if st.table == []:                       # true only on a deal's first move
+            opens.append((st.deal_no, st.leader, st.turn, seat,
+                          sorted(st.hands[seat]), list(st.legal_actions(seat))))
+        return st.legal_actions(seat)[0]
+
+    policies = {s: policy for s in range(4)}
+    first = m.play_deal(policies)
+
+    deal1_no, leader1, turn1, seat1, hand1, legal1 = opens[0]
+    assert deal1_no == 1
+    assert leader1 == turn1 == seat1 and SIX_SIX_ID in hand1
+    assert legal1 == [SIX_SIX_ID]                # deal 1: forced [6|6] opener
+
+    opens.clear()
+    next_deal_no = m.deal_no
+    m.play_deal(policies)
+
+    deal2_no, leader2, turn2, seat2, hand2, legal2 = opens[0]
+    assert deal2_no == next_deal_no
+    assert leader2 == turn2 == seat2 == first.winning_seat   # previous winner leads
+    assert legal2 == hand2                       # free lead: the whole hand is playable

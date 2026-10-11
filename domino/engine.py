@@ -166,9 +166,12 @@ class GameState:
         """Play ``tid`` from ``seat``'s hand onto the line.
 
         ``end`` is the target end index (0 = left, 1 = right). It is honoured
-        when the tile can attach to either open end; a tile that matches only
-        one end ignores it. Playing a double on an end leaves that end's value
-        unchanged.
+        when the tile matches both open ends and the two placements are
+        distinct; a tile that matches only one end has a single placement and
+        ``end`` is ignored (a wrong index is tolerated and falls back to that
+        placement, e.g. ``play(seat, tid, end=1)`` on a one-sided tile still
+        plays it on its only open end). Playing a double on an end leaves that
+        end's value unchanged.
         """
         if seat != self.turn:
             raise ValueError(f"seat {seat} cannot play on seat {self.turn}'s turn")
@@ -262,13 +265,17 @@ class DealOutcome:
     ``points`` is always the number of points banked by the winning team (the
     sum of the two opponents' remaining pips); the environment applies the
     differential/banked reward mode, never the engine.
+
+    ``reason`` is ``"emptied"``, ``"blocked"`` or ``"void_tie"``. The value
+    ``"wall"`` is reserved but unreachable: a full table (``NUM_TILES`` tiles)
+    implies every hand is empty, so the ``"emptied"`` branch always fires first.
     """
 
     winner_team: int | None
     points: int
     blocked: bool
     void: bool
-    reason: str                    # "emptied" | "blocked" | "void_tie" | "wall"
+    reason: str                    # "emptied" | "blocked" | "void_tie"
     winning_seat: int | None = None
 
 
@@ -330,6 +337,9 @@ class Match:
         self.deal_no = 1
         self.finished = False
         self.winner_team: int | None = None
+        # Seat owed the lead of the next deal (previous winner), or None while
+        # a forced ``[6|6]`` opener is still due (deal 1 / post-void redeal).
+        self._pending_leader: int | None = None
 
     def reset(self) -> None:
         self.__init__(target=self.target, seed=self.seed)
@@ -338,12 +348,19 @@ class Match:
         """Play one deal to the end and apply scoring.
 
         ``policy_by_seat`` maps seat -> callable ``(state, seat) -> action`` that
-        returns a legal tile id. A void deal is recorded, redealt and the same
-        loop continues until a non-void outcome scores. Raises ``ValueError`` if
-        a policy returns an illegal action.
+        returns a legal tile id. The lead follows the spec: deal 1 and any
+        post-void redeal force the ``[6|6]`` holder to open, while every later
+        deal is opened with a free lead by the previous deal's winner. A void
+        deal is recorded, redealt and the same loop continues until a non-void
+        outcome scores. Raises ``ValueError`` if a policy returns an illegal
+        action.
         """
-        state = new_deal(deal_no=self.deal_no, rng=self.rng, lead_mode="six_six",
-                         scores=list(self.scores))
+        if self._pending_leader is None:
+            state = new_deal(deal_no=self.deal_no, rng=self.rng, lead_mode="six_six",
+                             scores=list(self.scores))
+        else:
+            state = new_deal(deal_no=self.deal_no, rng=self.rng, lead_mode="winner",
+                             leader=self._pending_leader, scores=list(self.scores))
         while True:
             while not state.is_terminal():
                 seat = state.turn
@@ -364,6 +381,8 @@ class Match:
         self.deals.append(outcome)
         self.scores[outcome.winner_team] += outcome.points
         self.deal_no += 1
+        # The winner of the deal just scored leads the next deal with a free lead.
+        self._pending_leader = next_leader(state, outcome)
         if max(self.scores) >= self.target:
             self.finished = True
             self.winner_team = 0 if self.scores[0] >= self.scores[1] else 1
