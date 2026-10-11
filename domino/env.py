@@ -18,16 +18,18 @@ with the acting seat. The action space is ``Discrete(56)``
 Reward is the deal-level banked points (raw, undiscounted, no shaping): under
 ``reward_mode="differential"`` (default) the learner's team gets ``+points`` when
 it wins the deal and ``-points`` when it loses, while ``reward_mode="banked"``
-gives ``+points`` on a win and ``0`` otherwise. Only the deal-end transition
-carries reward; every non-terminal transition is exactly ``0.0``. A void deal
-scores nothing, is redealt and does not end the episode (mirroring
-:class:`domino.engine.Match`), and the lead rules are always taken from the engine
-(deal 1 and post-void redeals force the ``[6|6]`` lead, later deals are led by the
-previous deal's winner with a free lead). The deal shuffle and the per-deal
-opponent assignment flow through the environment's own
-:class:`numpy.random.Generator`, and a bare stochastic opponent is restored to
-its construction seed on ``reset`` -- so a seeded environment (with seeded
-opponents) is fully reproducible.
+gives ``+points`` on a win and ``0`` otherwise. Every scored deal emits its reward
+on the transition that ends it -- including the intermediate deals of a
+``max_deals_per_episode > 1`` episode -- and every other transition is exactly
+``0.0``. A void deal scores nothing, is redealt and does not end the episode
+(mirroring :class:`domino.engine.Match`), and the lead rules are always taken from
+the engine (deal 1 and post-void redeals force the ``[6|6]`` lead, later deals are
+led by the previous deal's winner with a free lead). The deal shuffle and the
+per-deal opponent assignment flow through the environment's own
+:class:`numpy.random.Generator`, and the environment owns its opponent: a bare
+:class:`~domino.agents.Agent` is deep-copied (the caller's object is never touched)
+and that copy is restored to its construction seed on ``reset`` -- so a seeded
+environment (with seeded opponents) is fully reproducible.
 
 Only ``gymnasium``, ``numpy`` and the engine/observation/mask/agent layers are
 imported here -- never torch, sb3 or pygame -- so the module is safe to import in
@@ -36,6 +38,8 @@ and in a headless process. The environment deliberately provides no ``render``
 method: the Pygame UI drives its own renderer.
 """
 from __future__ import annotations
+
+import copy
 
 import gymnasium as gym
 import numpy as np
@@ -75,7 +79,8 @@ class DominoEnv(gym.Env):
             The opposing team's source. A bare :class:`~domino.agents.Agent`
             plays both opposing seats; an :class:`~domino.agents.OpponentPool`
             is sampled per deal. ``None`` builds the default league pool from
-            ``env_cfg``.
+            ``env_cfg``. A bare agent is deep-copied so the environment owns the
+            object it reseeds on ``reset`` (the caller's agent is never mutated).
         env_cfg:
             Typed configuration (reward mode, learner seats, deal cap). Defaults
             to :class:`domino.config.EnvConfig`.
@@ -109,7 +114,7 @@ class DominoEnv(gym.Env):
 
         self._seed = None if seed is None else int(seed)
         self._rng = np.random.default_rng(self._seed)
-        self._opponent: Agent | OpponentPool = (
+        self._opponent: Agent | OpponentPool = self._adopt_opponent(
             opponent if opponent is not None else self._default_opponent()
         )
 
@@ -131,11 +136,27 @@ class DominoEnv(gym.Env):
         self._scored_this_step: DealOutcome | None = None
         self._void_this_step = False
         self._done = True
+        # The last learner seat to act: pinned as acting_seat on the terminal
+        # transition, where there is no decision point.
+        self._last_learner_seat: int | None = None
 
     # ---- construction helpers ------------------------------------------
     def _default_opponent(self) -> OpponentPool:
         """Build the default league pool from the environment configuration."""
         return OpponentPool(weights=self.env_cfg.opponent_weights, seed=self.env_cfg.seed)
+
+    def _adopt_opponent(self, opponent: Agent | OpponentPool) -> Agent | OpponentPool:
+        """Take ownership of the opponent without mutating the caller's object.
+
+        ``reset`` reseeds a bare stochastic opponent, so the environment must own
+        the object it reseeds: a bare :class:`~domino.agents.Agent` is deep-copied
+        (the caller's agent is never rewound, nor shared between environments).
+        An :class:`~domino.agents.OpponentPool` is kept as-is -- its per-deal draw
+        already flows through the environment's own generator.
+        """
+        if isinstance(opponent, OpponentPool):
+            return opponent
+        return copy.deepcopy(opponent)
 
     # ---- gymnasium API --------------------------------------------------
     def reset(
@@ -162,6 +183,7 @@ class DominoEnv(gym.Env):
         self._void_this_step = False
         self._deal_index = 0
         self._scores = [0, 0]
+        self._last_learner_seat = None
 
         self._opponent_agents = self._sample_opponent_team()
         self._state = self._deal_new()
@@ -211,20 +233,42 @@ class DominoEnv(gym.Env):
 
     @property
     def acting_seat(self) -> int:
-        """The seat to act at the current decision point (a learner seat)."""
-        return self._state.turn
+        """The learner seat to act.
+
+        At a decision point this is the seat about to act (always a learner
+        seat). On the terminal transition there is no decision point, so it is
+        pinned to the last learner seat that acted -- the property always names
+        a learner seat.
+        """
+        return self._acting_seat()
 
     def set_opponent(self, opponent: Agent | OpponentPool) -> None:
-        """Swap the opposing team's source mid-life (takes effect next deal)."""
-        self._opponent = opponent
+        """Swap the opposing team's source mid-life (takes effect next deal).
+
+        The environment takes ownership of a bare opponent by copying it, so the
+        caller's object is never mutated.
+        """
+        self._opponent = self._adopt_opponent(opponent)
 
     # ---- turn loop ------------------------------------------------------
+    def _acting_seat(self) -> int:
+        """The seat whose perspective the observation uses.
+
+        The current turn at a decision point, or -- once the episode has ended,
+        where there is no decision point -- the last learner seat that acted.
+        """
+        if self._done:
+            return self._last_learner_seat
+        return self._state.turn
+
     def _advance(self) -> tuple[float, bool]:
         """Resolve the game to the next learner decision or a scored deal end.
 
         Returns ``(reward, terminated)``. Void deals are redealt in place (no
-        reward, no episode end); every scored deal emits its reward and, once
-        ``max_deals_per_episode`` scored deals have been played, ends the episode.
+        reward, no episode end). Every scored deal emits its reward on the
+        transition that ends it: the final deal of the episode ends it, while an
+        intermediate deal (``max_deals_per_episode > 1``) deals the next deal,
+        advances to its first decision point and still returns the reward.
         """
         self._scored_this_step = None
         self._void_this_step = False
@@ -247,8 +291,16 @@ class DominoEnv(gym.Env):
             if self._deals_scored >= self._max_deals:
                 self._done = True
                 return reward, True
+            # Non-final deal end: emit this deal's reward on this transition and
+            # return at the next deal's first decision point -- do not fall
+            # through to the top-of-loop 0.0, which would discard the reward.
             self._opponent_agents = self._sample_opponent_team()
             self._state = self._deal_new()
+            while not self._advance_to_decision():
+                self._pending_leader = None
+                self._opponent_agents = self._sample_opponent_team()
+                self._state = self._deal_new()
+            return reward, False
 
     def _advance_to_decision(self) -> bool:
         """Play out opponent turns and forced passes until a learner decision.
@@ -262,6 +314,7 @@ class DominoEnv(gym.Env):
                 self._state.pass_turn(seat)          # forced pass: never a decision
                 continue
             if seat in self._learner_seats:
+                self._last_learner_seat = seat
                 return True
             action = int(self._agent_for_seat(seat).act(self._state, seat))
             tile_id, end = decode_action(action)
@@ -312,12 +365,12 @@ class DominoEnv(gym.Env):
         return opponent, opponent
 
     def _reseed_opponent(self) -> None:
-        """Restore a bare stochastic opponent to its construction seed.
+        """Restore the env-owned bare opponent to its construction seed.
 
-        ``reset(seed=...)`` must make the whole environment reproducible, which
-        includes the play of a bare opponent that owns its own generator (a
-        :class:`~domino.agents.RandomAgent`). The pool path needs no reset here:
-        its per-deal assignment is already drawn from the environment's generator.
+        The environment always owns its opponent (a bare ``Agent`` is
+        deep-copied in ``__init__``/``set_opponent``), so this never mutates a
+        caller-supplied object. The pool path needs no reset here: its per-deal
+        assignment is already drawn from the environment's generator.
         """
         opponent = self._opponent
         if isinstance(opponent, OpponentPool):
@@ -331,8 +384,12 @@ class DominoEnv(gym.Env):
 
     # ---- observation and info ------------------------------------------
     def _observation(self) -> np.ndarray:
-        """Seat-relative 192-dim encoding for the seat to act."""
-        return encode(self._state, self._state.turn)
+        """Seat-relative 192-dim encoding for the seat to act.
+
+        On the terminal transition the seat is the last learner seat that acted
+        (there is no decision point), so the encoding stays learner-relative.
+        """
+        return encode(self._state, self._acting_seat())
 
     def _info(self) -> dict:
         """Build the ``info`` dict for the current position.
@@ -353,7 +410,7 @@ class DominoEnv(gym.Env):
             points_opponent = outcome.points if outcome.winner_team == 1 else 0
             deal_outcome = outcome.reason
         return {
-            "acting_seat": int(self._state.turn),
+            "acting_seat": int(self._acting_seat()),
             "deal_index": int(self._deal_index),
             "deal_outcome": deal_outcome,
             "void_deal": bool(self._void_this_step) if outcome is None else bool(outcome.void),

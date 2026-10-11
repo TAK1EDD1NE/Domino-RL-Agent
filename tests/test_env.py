@@ -22,7 +22,7 @@ from domino.agents import OpponentPool, RandomAgent
 from domino.config import EnvConfig
 from domino.env import DominoEnv
 from domino.masks import action_index
-from domino.obs import OBS_DIM
+from domino.obs import OBS_DIM, encode
 
 LEARNER_SEATS = (0, 2)
 
@@ -189,17 +189,30 @@ def test_multi_deal_episode_and_invalid_max_deals():
     env.reset(seed=5)
     deal_ends = 0
     indices = []
+    reward_sum = 0.0
+    differential_sum = 0.0
+    deal_end_rewards: list[float] = []
     while True:
-        _, _, term, trunc, info = _step_lowest(env)
+        _, r, term, trunc, info = _step_lowest(env)
+        reward_sum += r
         indices.append(info["deal_index"])
         if info["points_learner"] is not None:      # a scored deal ended
             assert info["deal_outcome"] in ("emptied", "blocked")
             deal_ends += 1
+            deal_end_rewards.append(r)
+            differential_sum += info["differential"]
         if term or trunc:
             break
     assert deal_ends == 3                       # three scored deals in one episode
     assert indices == sorted(indices)
     assert indices[-1] > indices[0]             # deal_index advances
+    # Every deal-end transition carries its own reward -- including the
+    # intermediate deals -- and the episode's reward equals the summed
+    # per-deal differentials reported in info.
+    assert len(deal_end_rewards) == 3
+    assert all(r != 0.0 for r in deal_end_rewards)
+    assert reward_sum == pytest.approx(differential_sum)
+    assert reward_sum == pytest.approx(sum(deal_end_rewards))
 
     with pytest.raises(ValueError):
         DominoEnv(env_cfg=EnvConfig(max_deals_per_episode=0))
@@ -247,14 +260,64 @@ def test_league_wiring_rule_random_and_set_opponent():
     env2.reset(seed=0)
     assert [agent.name for agent in env2._opponent_agents] == ["random", "random"]
 
-    # set_opponent swaps the opponent mid-life without breaking the loop
+    # set_opponent swaps the opponent mid-life without breaking the loop. The
+    # env owns a copy, so the caller's recorder is never used or mutated.
     env3 = DominoEnv(opponent=RandomAgent(seed=0), seed=0)
     env3.reset(seed=0)
     _step_lowest(env3)
     recorder2 = _RecordingAgent()
     env3.set_opponent(recorder2)
+    assert env3._opponent is not recorder2     # the env owns a copy
     _run_deals(env3, deals=5)
-    assert recorder2.calls > 0
+    assert env3._opponent.calls > 0
+    assert recorder2.calls == 0
+
+
+# 9b --------------------------------------------------------------------------
+def test_env_owns_its_opponent_and_leaves_the_caller_untouched():
+    agent = RandomAgent(seed=0)
+    caller_rng = agent._rng
+    env = DominoEnv(opponent=agent, seed=0)
+    assert env._opponent is not agent               # the env owns a copy
+    env.reset(seed=0)
+    env.reset(seed=0)                               # double reset (check_env style)
+    assert agent._rng is caller_rng                 # caller's generator never rewound
+    assert env._opponent._rng is not caller_rng     # the copy owns its own stream
+
+    # Two envs given the same caller object never share an opponent.
+    other = DominoEnv(opponent=agent, seed=0)
+    assert other._opponent is not env._opponent
+    assert other._opponent is not agent
+
+    # The owned copy is what plays, and it stays deterministic across same-seed envs.
+    def trace() -> tuple:
+        e = DominoEnv(opponent=RandomAgent(seed=0), seed=0)
+        e.reset(seed=0)
+        while True:
+            _, _, term, _, info = _step_lowest(e)
+            if term:
+                return (info["deal_outcome"], info["points_learner"], info["points_opponent"])
+
+    assert trace() == trace()
+
+
+# 9c --------------------------------------------------------------------------
+def test_terminal_step_acting_seat_is_the_last_learner_seat():
+    env = DominoEnv(opponent=RandomAgent(seed=6), seed=6)
+    env.reset(seed=6)
+    last_seat = None
+    while True:
+        obs, _, term, _, info = _step_lowest(env)
+        assert info["acting_seat"] in LEARNER_SEATS      # a learner seat at every step
+        if term:
+            # No decision point at termination: pinned to the last learner seat.
+            assert info["acting_seat"] == last_seat
+            break
+        last_seat = info["acting_seat"]
+    assert env.acting_seat in LEARNER_SEATS
+    assert info["acting_seat"] == env.acting_seat
+    # The returned terminal observation is seat-relative to that pinned seat.
+    assert np.array_equal(obs, encode(env.state, env.acting_seat))
 
 
 # 10 --------------------------------------------------------------------------

@@ -199,7 +199,8 @@ unit-tested exhaustively.
   reward is returned; otherwise the next learner decision point is returned.
 * `action_masks()` for the acting learner seat.
 * `info` carries per-deal diagnostics used by logging and evaluation: `deal_winner`,
-  `deal_points`, `blocked`, `void_deal`, `deal_steps`, `deals_played`, `match_scores`.
+  `deal_points`, `blocked`, `void_deal`, `deal_steps`, `deals_played`, `match_scores`;
+  `deal_index` — reset-scoped, monotonically increasing within an episode.
 * Options: `{"max_deals_per_episode": 1, "opponent": "league"|"self"|"rule"|"random"|"mixed",
   "seed": int}`.
 
