@@ -39,6 +39,14 @@ Algerian/Maghrebi 2v2 domino ("domino", not the draw variant).
 * Doubles: mechanically identical to any other tile — playing `[3|3]` on a 3-end leaves the
   3-end open. There is no obligation to "close" a double and no extra end is created.
   Rendering only differs (doubles are drawn crosswise, section 11).
+* The line exposes exactly **two ends**. A tile is placed on one of them, and the ends are the
+  outer pip values of the line: after a free lead of `[a|b]` the ends are `a` and `b` (both `a`
+  when the lead is a double).
+* A move is therefore a pair **(tile, end)**. When a tile matches both ends the two placements are
+  legally distinct and can lead to different positions (ends `[3,5]` with the tile `[3|5]` in hand:
+  attaching to the 3-end leaves `[5,5]`, attaching to the 5-end leaves `[3,3]`). The engine
+  enumerates both; when the two placements are equivalent (the ends carry the same value) only one
+  is kept, so no duplicate move is ever exposed.
 * Passing: a player **must** play a legal tile if they hold one. A pass is legal only when
   the player holds no tile matching either open end.
 * Block: the deal is blocked when the last **four consecutive turns were all passes**
@@ -77,8 +85,9 @@ reported.
   information plus the acting seat's own hand (section 4). It is *seat-relative*: the same
   vector layout describes the situation from the point of view of whichever controlled seat
   is about to act, so one network can play both seats.
-* **Action**: an integer in `Discrete(28)` — the tile id played (section 5).
-* **Action mask**: a 28-dimensional boolean vector; `False` for any tile that is not in the
+* **Action**: an integer in `Discrete(56)` encoding the move `(tile, end)`: `action = 2 tile_id + end`
+  with `end ∈ {0 = left, 1 = right}` (section 5).
+* **Action mask**: a 56-dimensional boolean vector; `False` for any tile that is not in the
   acting seat's hand or is not playable on either open end (and, when leading, any tile not
   in hand). Whether the acting seat can play at all is decided by the engine: a turn with no
   legal tile is a **forced pass and is not a decision point** for the agent (there is no
@@ -141,15 +150,19 @@ imported everywhere; the mapping is a unit test.
 
 ## 5. Action space and masking
 
-* `gym.spaces.Discrete(28)`; action = tile id to play.
-* The engine exposes `legal_actions(state) -> set[int]` for the acting seat: tiles in hand
-  matching either open end; all hand tiles when the board is empty; the singleton `{id(6,6)}`
-  for the forced opening lead of deal 1 and of a redeal after a void deal.
-* `action_masks()` returns a `np.bool_` array of length 28 from that set, which is exactly the
-  interface `MaskablePPO` expects. Illegal logits are set to `-inf` by SB3.
+* `gym.spaces.Discrete(56)`; `action = 2 * tile_id + end_index`, where `end_index` is
+  `0 = left end`, `1 = right end`. A lead (empty board) uses `end_index = 0` only.
+* The engine exposes `legal_moves(state, seat) -> list[tuple[int, int]]` — `(tile_id, end_index)`
+  pairs for every placement that is legal, deduplicated when the two placements would produce the
+  same position — plus the tile-level convenience view `legal_actions(state, seat) -> list[int]`
+  used by the rule bot, the Pygame UI and the diagnostics. Tiles that match no open end are never
+  listed; the forced opening lead of deal 1 (and of a redeal after a void deal) yields exactly the
+  one move `(id(6,6), 0)`.
+* `action_masks()` returns a `np.bool_` array of length 56 built from `legal_moves`, which is
+  exactly the interface `MaskablePPO` expects. Illegal logits are set to `-inf` by SB3.
 * Pass actions are **not** in the action space (see section 3).
 * Invariant enforced by a test: `mask.sum() >= 1` at every decision point, and the sampled
-  action is always in `legal_actions`.
+  action is always in `legal_moves`.
 
 ---
 
@@ -214,7 +227,7 @@ trunk  : concat(128 + 256 = 384)
                        -> Linear 384->256, LayerNorm, ReLU
                        -> Linear 256->256, LayerNorm, ReLU
                        -> Linear 256->128, LayerNorm, ReLU      -> 128 features
-heads  : SB3 policy head Linear(128->28)  (masked at sampling time)
+heads  : SB3 policy head Linear(128->56)  (masked at sampling time)
          SB3 value  head Linear(128->1)
 ```
 
@@ -338,8 +351,10 @@ run); training never imports pygame.
   `--model models/checkpoints/latest.zip`, `--seed`, `--match-to 100`.
 * Board rendered as a single line; doubles drawn crosswise (perpendicular) exactly as on a
   physical table, with a small gap marker so the line stays readable.
-* Legal tiles highlighted, illegal ones dimmed; clicking a tile plays it; a "pass" indicator is
-  shown automatically when the human is stuck (mandatory-play rule).
+* Legal tiles highlighted, illegal ones dimmed; clicking a tile with a single legal placement plays it
+  immediately, while clicking an ambiguous one (matching both ends) highlights both target ends and the
+  second click chooses the end; a "pass" indicator is shown automatically when the human is stuck
+  (mandatory-play rule).
 * Info panel: hands' tile counts, table ends, pass streak, remaining points, deal and match
   scores, and a text line reporting the last action of each AI seat.
 * Buttons/keys: new deal, restart match, toggle AI autoplay for the human seat (useful for a
