@@ -40,6 +40,7 @@ method: the Pygame UI drives its own renderer.
 from __future__ import annotations
 
 import copy
+from typing import Sequence
 
 import gymnasium as gym
 import numpy as np
@@ -249,6 +250,21 @@ class DominoEnv(gym.Env):
         caller's object is never mutated.
         """
         self._opponent = self._adopt_opponent(opponent)
+
+    def refresh_pool(self, paths: Sequence[str]) -> None:
+        """Notify the league pool of the current snapshot paths (spec section 8).
+
+        The training :class:`~domino.callbacks.SnapshotCallback` calls this on
+        every worker through ``vec_env.env_method("refresh_pool", paths)`` after
+        it has written a new frozen checkpoint. When the current opponent is an
+        :class:`~domino.agents.OpponentPool` the call is delegated to
+        :meth:`OpponentPool.refresh_snapshots`; when it is a bare
+        :class:`~domino.agents.Agent` (a single fixed opponent) this is a no-op,
+        so the method is safe to call unconditionally on every worker.
+        """
+        opponent = self._opponent
+        if isinstance(opponent, OpponentPool):
+            opponent.refresh_snapshots(paths)
 
     # ---- turn loop ------------------------------------------------------
     def _acting_seat(self) -> int:

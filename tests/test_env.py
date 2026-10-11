@@ -359,3 +359,25 @@ def test_env_module_imports_no_torch_or_pygame():
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+# 13 --------------------------------------------------------------------------
+def test_refresh_pool_delegates_for_pool_and_is_noop_for_bare_agent(tmp_path):
+    # A league pool: refresh_pool forwards the paths to its snapshot list.
+    fake = tmp_path / "policy_1.zip"
+    fake.write_bytes(b"placeholder")
+    pool = OpponentPool(weights={"snapshot": 0.5, "rule": 0.5}, seed=0)
+    env = DominoEnv(opponent=pool, seed=0)
+    assert "snapshot" not in env._opponent._available_weights()   # no snapshots yet
+    env.refresh_pool([str(fake)])
+    assert env._opponent._snapshot_paths == [str(fake)]
+    assert "snapshot" in env._opponent._available_weights()       # now drawable
+
+    # An empty refresh clears the list (still a valid delegation).
+    env.refresh_pool([])
+    assert env._opponent._snapshot_paths == []
+
+    # A bare agent: refresh_pool must be a harmless no-op.
+    env2 = DominoEnv(opponent=RandomAgent(seed=0), seed=0)
+    env2.refresh_pool([str(fake)])              # must not raise
+    assert not isinstance(env2._opponent, OpponentPool)
