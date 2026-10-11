@@ -36,15 +36,10 @@ from domino.callbacks import (
     SnapshotCallback,
     TAG_TOTAL_REWARD,
     TAG_WINDOW_AVG,
-    enable_checkpoint_loading,
 )
 from domino.config import TrainConfig
 from domino.env import DominoEnv
 from domino.policy import DominoMaskablePolicy, policy_kwargs_for
-
-# The league loads frozen snapshots during training; the torch/SB3 workaround
-# must be active in this process too (see domino.callbacks.enable_checkpoint_loading).
-enable_checkpoint_loading()
 
 WORKER_WEIGHTS = {"snapshot": 0.6, "rule": 0.25, "random": 0.15}
 RUN_NAME = "cb_test"

@@ -47,14 +47,11 @@ Nothing here imports ``pygame``; the module is on the training path only.
 from __future__ import annotations
 
 import csv
-import io
-import zipfile
 from collections import deque
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch as th
 from stable_baselines3.common.callbacks import BaseCallback
 
 #: Width of the sliding window used for the average episode reward (assignment).
@@ -68,35 +65,6 @@ TAG_WINDOW_AVG = "train/avg_episode_reward_window_100"
 TAG_BLOCK_RATE = "deals/block_rate"
 TAG_VOID_RATE = "deals/void_rate"
 TAG_POINTS_PER_DEAL = "deals/points_per_deal"
-
-
-def enable_checkpoint_loading() -> None:
-    """Work around a torch 2.5 + SB3 incompatibility when loading checkpoints.
-
-    ``stable_baselines3.common.save_util.load_from_zip_file`` hands a
-    ``zipfile.ZipExtFile`` straight to ``torch.load``. On torch 2.5.1 that call
-    fails with ``PytorchStreamReader failed reading file .data/serialization_id:
-    file read failed`` even though the object reports ``seekable() == True``;
-    reading the archive member into an :class:`io.BytesIO` first makes the very
-    same call succeed. Without this, **every** ``MaskablePPO.load`` in this
-    environment fails -- which would break both ``--resume`` and the league's
-    snapshot opponents.
-
-    The patch is idempotent and only intercepts ``ZipExtFile`` inputs, so it is
-    transparent to every other ``torch.load`` caller. Call it once per process
-    (``train.py`` does so in ``main`` and in the worker factory).
-    """
-    if getattr(th.load, "_domino_zip_compat", False):
-        return
-    original_load = th.load
-
-    def _load(source: Any, *args: Any, **kwargs: Any) -> Any:
-        if isinstance(source, zipfile.ZipExtFile):
-            source = io.BytesIO(source.read())
-        return original_load(source, *args, **kwargs)
-
-    _load._domino_zip_compat = True  # type: ignore[attr-defined]
-    th.load = _load
 
 
 def _tensorboard_writer(logger: Any) -> tuple[Any | None, bool]:
@@ -411,5 +379,4 @@ __all__ = [
     "CheckpointCallback",
     "EpisodeStatsCallback",
     "SnapshotCallback",
-    "enable_checkpoint_loading",
 ]

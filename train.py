@@ -61,7 +61,6 @@ from domino.callbacks import (
     CheckpointCallback,
     EpisodeStatsCallback,
     SnapshotCallback,
-    enable_checkpoint_loading,
 )
 from domino.config import TrainConfig, apply_overrides, load_config
 from domino.env import DominoEnv
@@ -100,9 +99,8 @@ def make_domino_env(
     """
     env_cfg = replace(cfg.env, seed=int(seed), opponent_weights=dict(weights))
     pool = OpponentPool(weights=dict(weights), seed=int(seed), mix_opponents=bool(mix_opponents))
-    # Snapshot opponents are loaded lazily inside this worker, so the torch/SB3
-    # checkpoint-loading workaround must be active in the worker process too.
-    enable_checkpoint_loading()
+    # Snapshot opponents are loaded lazily inside this worker; MaskablePPO.load
+    # works natively on the pinned SB3 2.7.1 (no torch.load shim needed).
     return DominoEnv(opponent=pool, env_cfg=env_cfg, seed=int(seed))
 
 
@@ -110,13 +108,19 @@ def opponent_weights(opponent: str, live_self: bool = False) -> dict[str, float]
     """Map a ``--opponent`` value onto opponent-pool weights (ruling 2).
 
     ``league``/``mixed`` use the frozen-snapshot league (or the live-self league
-    when ``live_self``); ``self`` is snapshot-only self-play, ``rule`` and
-    ``random`` are single-source pools.
+    when ``live_self``); ``rule`` and ``random`` are single-source pools.
+
+    ``self`` means pure mirror self-play (spec section 15, ablation A1). When a
+    live learner is available (``live_self``, i.e. the in-process ``--n-envs 1``
+    path) it maps to ``{"self": 1.0}`` so the opponent *is* the current learner;
+    on the vectorised ``SubprocVecEnv`` path, where a live learner cannot be
+    shared into a spawned worker, it falls back to ``{"snapshot": 1.0}``
+    (delayed self-play against the newest frozen snapshot).
     """
     if opponent in ("league", "mixed"):
         return dict(LIVE_LEAGUE_WEIGHTS if live_self else FROZEN_LEAGUE_WEIGHTS)
     if opponent == "self":
-        return {"snapshot": 1.0}
+        return {"self": 1.0} if live_self else {"snapshot": 1.0}
     if opponent == "rule":
         return {"rule": 1.0}
     if opponent == "random":
@@ -288,10 +292,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the trainer end to end and return a process exit code."""
     args = build_parser().parse_args(argv)
     cfg = resolve_config(args)
-
-    # torch 2.5 + SB3 checkpoint-loading workaround (needed for --resume here and
-    # for snapshot opponents in the workers; see domino.callbacks).
-    enable_checkpoint_loading()
 
     runs_dir = RUNS_DIR / cfg.run_name
     results_dir = RESULTS_DIR
