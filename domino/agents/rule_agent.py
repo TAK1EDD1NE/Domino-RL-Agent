@@ -141,8 +141,10 @@ class RuleAgent:
             score += weights.keep_doubles
 
         # Block economics: be lighter than the lightest estimated opponent.
-        score += weights.block_economics * (2.0 if block_close else 1.0) * self._block_term(
-            state, after, seat, block_close
+        # Spec section 10 keeps this term in the table at all times (weight 2.0);
+        # the block-awareness rule only *doubles* it when a block is close.
+        score += weights.block_economics * (2.0 if block_close else 1.0) * self._block_advantage(
+            after, seat
         )
 
         # Leading: prefer a value you still hold a duplicate of (end-switcher).
@@ -154,20 +156,6 @@ class RuleAgent:
         return float(score)
 
     # ---- internals -----------------------------------------------------
-    def _block_term(self, state: GameState, after: GameState, seat: int, block_close: bool) -> float:
-        """Raw, unweighted "reduce my expected loss on a block" term in ``[-1, 1]``.
-
-        The term estimates the acting seat's pip position against the lightest
-        opponent it can infer from public information, and is a property of the
-        *resulting* position. Losing a blocked deal is only a real risk once a
-        block is a prospect, so the term contributes only when the caller flags
-        ``block_close`` (``sum(live) <= 12`` or ``pass_streak >= 2``, spec
-        section 10); the caller then doubles the weight.
-        """
-        if not block_close:
-            return 0.0
-        return self._block_advantage(after, seat)
-
     @staticmethod
     def _block_advantage(after: GameState, seat: int) -> float:
         """Signed, bounded ``[-1, 1]`` measure of being the lightest-pip player.
