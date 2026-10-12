@@ -65,6 +65,52 @@ TAG_WINDOW_AVG = "train/avg_episode_reward_window_100"
 TAG_BLOCK_RATE = "deals/block_rate"
 TAG_VOID_RATE = "deals/void_rate"
 TAG_POINTS_PER_DEAL = "deals/points_per_deal"
+#: Number of distinct opening deals inside the sliding window (frozen-deal guard).
+TAG_DISTINCT_DEALS = "deals/distinct_deals_window"
+#: A full window holding this few distinct deals means the env is replaying deals.
+LOW_DIVERSITY_THRESHOLD = 2
+
+
+class DealDiversity:
+    """Counts distinct opening deals inside a sliding window.
+
+    A healthy training run deals a fresh shuffle every episode, so a full window
+    of ``window`` episodes holds ``window`` distinct deals. An environment that
+    re-dealt one deal per worker (a sticky seed: subproc vec-env workers
+    auto-reset with ``seed=None``) trains on a handful of positions, which shows
+    up as an almost flat reward window, an entropy collapse to zero and a policy
+    that scores at random level on fresh deals -- the whole failure used to be
+    invisible in the run's own diagnostics. This guard makes it loud.
+    """
+
+    def __init__(self, window: int) -> None:
+        if window < 1:
+            raise ValueError(f"window must be >= 1, got {window}")
+        self.window = int(window)
+        self._keys: deque[int] = deque(maxlen=int(window))
+
+    def add(self, deal_key: int) -> None:
+        """Record the opening deal of one finished episode."""
+        self._keys.append(int(deal_key))
+
+    @property
+    def distinct(self) -> int:
+        """Distinct opening deals currently inside the window."""
+        return len(set(self._keys))
+
+    @property
+    def full(self) -> bool:
+        """Whether the window holds ``window`` episodes yet."""
+        return len(self._keys) == self.window
+
+    @property
+    def episodes(self) -> int:
+        """Episodes currently inside the window."""
+        return len(self._keys)
+
+    def low_diversity(self, threshold: int = LOW_DIVERSITY_THRESHOLD) -> bool:
+        """Whether a full window holds at most ``threshold`` distinct deals."""
+        return self.full and self.distinct <= int(threshold)
 
 
 def _tensorboard_writer(logger: Any) -> tuple[Any | None, bool]:
@@ -131,6 +177,9 @@ class EpisodeStatsCallback(BaseCallback):
         self._owns_writer = False
         self._ep_reward: np.ndarray | None = None
         self._window: deque[float] = deque(maxlen=self.window)
+        #: Frozen-deal guard: distinct opening deals in the sliding window.
+        self.diversity = DealDiversity(self.window)
+        self._alarmed = False
         self._episode = 0
         self._deals = 0
         self._blocked = 0
@@ -144,6 +193,8 @@ class EpisodeStatsCallback(BaseCallback):
 
         self.rows = []
         self._window = deque(maxlen=self.window)
+        self.diversity = DealDiversity(self.window)
+        self._alarmed = False
         self._episode = 0
         self._deals = 0
         self._blocked = 0
@@ -224,6 +275,10 @@ class EpisodeStatsCallback(BaseCallback):
         points = info.get("points_learner")
         if points is not None:
             self._points_sum += float(points)
+        deal_key = info.get("deal_key")
+        if deal_key is not None:
+            self.diversity.add(int(deal_key))
+            self._check_diversity()
 
         self._window.append(total_reward)
         window_avg = float(np.mean(self._window))
@@ -238,6 +293,25 @@ class EpisodeStatsCallback(BaseCallback):
 
         self._log_scalars(step, total_reward, window_avg)
 
+    def _check_diversity(self) -> None:
+        """Shout when a full window holds almost no distinct deals.
+
+        Warned once per low-diversity stretch (and re-armed when diversity
+        recovers), so a frozen-deal bug is visible in the run's own stdout
+        instead of only under an independent evaluation.
+        """
+        if self.diversity.low_diversity():
+            if not self._alarmed:
+                self._alarmed = True
+                print(
+                    f"[EpisodeStatsCallback] WARNING: only {self.diversity.distinct} "
+                    f"distinct deal(s) in the last {self.diversity.episodes} episodes "
+                    f"({TAG_DISTINCT_DEALS}); the environment is replaying deals and "
+                    "the reward window is memorisation, not skill."
+                )
+        else:
+            self._alarmed = False
+
     def _log_scalars(self, step: int, total_reward: float, window_avg: float) -> None:
         """Write the convergence scalars and the running deal diagnostics."""
         if self._writer is None:
@@ -248,6 +322,7 @@ class EpisodeStatsCallback(BaseCallback):
         attempted = self._deals + self._voids
         self._writer.add_scalar(TAG_VOID_RATE, self._voids / attempted if attempted else 0.0, step)
         self._writer.add_scalar(TAG_POINTS_PER_DEAL, self._points_sum / self._deals, step)
+        self._writer.add_scalar(TAG_DISTINCT_DEALS, self.diversity.distinct, step)
 
 
 class SnapshotCallback(BaseCallback):

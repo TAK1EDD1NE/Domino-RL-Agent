@@ -40,11 +40,13 @@ method: the Pygame UI drives its own renderer.
 from __future__ import annotations
 
 import copy
+import zlib
 from typing import Sequence
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
+from gymnasium.utils import seeding
 
 from .agents import Agent, OpponentPool
 from .config import REWARD_MODES, EnvConfig
@@ -58,6 +60,22 @@ from .engine import (
 )
 from .masks import ACTION_DIM, action_mask, decode_action
 from .obs import OBS_DIM, encode
+
+
+def _opening_key(state: GameState) -> int:
+    """Stable fingerprint of a deal's opening position (hands, turn, leader).
+
+    Reported per step as ``info["deal_key"]`` so a trainer can count how many
+    distinct deals it is actually playing: an environment that re-dealt the same
+    shuffle every episode used to look like a converged run (flat reward window,
+    entropy collapsed to zero) while the policy was only memorising a handful of
+    positions. ``crc32`` of a canonical string keeps the id small, cheap and
+    identical across processes and machines.
+    """
+    hands = "|".join(",".join(str(tile) for tile in sorted(hand)) for hand in state.hands)
+    payload = f"{hands}|table={','.join(str(tile) for tile in state.table)}"
+    payload += f"|turn={state.turn}|leader={state.leader}|six_six={int(state.forced_leader_six_six)}"
+    return int(zlib.crc32(payload.encode("ascii")))
 
 
 class DominoEnv(gym.Env):
@@ -114,7 +132,12 @@ class DominoEnv(gym.Env):
         )
 
         self._seed = None if seed is None else int(seed)
-        self._rng = np.random.default_rng(self._seed)
+        # All episode randomness flows through gymnasium's own generator: the
+        # constructor seed seeds the first episode and ``reset(seed=...)``
+        # re-seeds it, so ``self._seed`` is bookkeeping only. Deriving the deal
+        # shuffle from a sticky seed instead made every episode replay one deal.
+        self.np_random, self._np_random_seed = seeding.np_random(self._seed)
+        self._rng = np.random.default_rng(int(self.np_random.integers(0, 2**31 - 1)))
         self._opponent: Agent | OpponentPool = self._adopt_opponent(
             opponent if opponent is not None else self._default_opponent()
         )
@@ -140,6 +163,10 @@ class DominoEnv(gym.Env):
         # The last learner seat to act: pinned as acting_seat on the terminal
         # transition, where there is no decision point.
         self._last_learner_seat: int | None = None
+        # Opening-deal fingerprint of the deal in play, and of the deal whose
+        # outcome is reported on this transition (info["deal_key"]).
+        self._deal_key = 0
+        self._scored_key: int | None = None
 
     # ---- construction helpers ------------------------------------------
     def _default_opponent(self) -> OpponentPool:
@@ -165,17 +192,19 @@ class DominoEnv(gym.Env):
     ) -> tuple[np.ndarray, dict]:
         """Start a new episode and return the first learner decision point.
 
-        Reseeds the environment's own generator (and, through it, the per-deal
-        opponent assignment) so ``reset(seed=...)`` is reproducible, deals the
-        first deal and advances through opponent turns and forced passes to the
-        first learner decision.
+        Draws this episode's deal seed from gymnasium's generator and routes the
+        per-deal opponent assignment through the resulting generator, so
+        ``reset(seed=...)`` reproduces an episode exactly while an unseeded
+        reset -- what a vector-env worker does after every episode -- deals a
+        fresh shuffle. Deals the first deal and advances through opponent turns
+        and forced passes to the first learner decision.
         """
         super().reset(seed=seed)
         if seed is not None:
             self._seed = int(seed)
-        if self._seed is None:
-            self._seed = int(self.np_random.integers(0, 2**31 - 1))
-        self._rng = np.random.default_rng(self._seed)
+        # ``self.np_random`` advances on every reset and is rebuilt from ``seed``
+        # when one is given: one fresh deal seed per episode, reproducibly.
+        self._rng = np.random.default_rng(int(self.np_random.integers(0, 2**31 - 1)))
 
         self._done = False
         self._pending_leader = None
@@ -185,6 +214,7 @@ class DominoEnv(gym.Env):
         self._deal_index = 0
         self._scores = [0, 0]
         self._last_learner_seat = None
+        self._scored_key = None
 
         self._opponent_agents = self._sample_opponent_team()
         self._state = self._deal_new()
@@ -287,6 +317,7 @@ class DominoEnv(gym.Env):
         advances to its first decision point and still returns the reward.
         """
         self._scored_this_step = None
+        self._scored_key = None
         self._void_this_step = False
         while True:
             if self._advance_to_decision():
@@ -297,12 +328,14 @@ class DominoEnv(gym.Env):
                 self._pending_leader = None
                 self._opponent_agents = self._sample_opponent_team()
                 self._state = redeal_after_void(self._state)
+                self._deal_key = _opening_key(self._state)
                 self._deal_index += 1
                 continue
             reward = self._deal_reward(outcome)
             self._scores[outcome.winner_team] += outcome.points
             self._pending_leader = next_leader(self._state, outcome)
             self._scored_this_step = outcome
+            self._scored_key = self._deal_key
             self._deals_scored += 1
             if self._deals_scored >= self._max_deals:
                 self._done = True
@@ -342,19 +375,22 @@ class DominoEnv(gym.Env):
         """Deal a fresh deal, delegating the lead rule to the engine."""
         self._deal_index += 1
         if self._pending_leader is None:
-            return new_deal(
+            state = new_deal(
                 deal_no=self._deal_index,
                 rng=self._rng,
                 lead_mode="six_six",
                 scores=list(self._scores),
             )
-        return new_deal(
-            deal_no=self._deal_index,
-            rng=self._rng,
-            lead_mode="winner",
-            leader=self._pending_leader,
-            scores=list(self._scores),
-        )
+        else:
+            state = new_deal(
+                deal_no=self._deal_index,
+                rng=self._rng,
+                lead_mode="winner",
+                leader=self._pending_leader,
+                scores=list(self._scores),
+            )
+        self._deal_key = _opening_key(state)
+        return state
 
     def _deal_reward(self, outcome: DealOutcome) -> float:
         """Apply the configured reward mode to a scored deal."""
@@ -410,11 +446,15 @@ class DominoEnv(gym.Env):
     def _info(self) -> dict:
         """Build the ``info`` dict for the current position.
 
-        ``acting_seat`` and ``deal_index`` are always present. The deal-level keys
-        are populated when a scored deal ended on this transition (the terminal
-        step, or an intermediate deal end of a multi-deal episode) and ``None``
-        otherwise; a void redeal is reported through ``void_deal`` (``True``) and
-        ``deal_outcome="void_tie"`` on the otherwise non-terminal step it happens.
+        ``acting_seat``, ``deal_index`` and ``deal_key`` are always present.
+        ``deal_key`` is the opening-position fingerprint of the deal in play, or
+        -- on a transition that reports a scored deal -- of the deal that just
+        ended, so a trainer can count how many distinct deals it has seen. The
+        deal-level keys are populated when a scored deal ended on this transition
+        (the terminal step, or an intermediate deal end of a multi-deal episode)
+        and ``None`` otherwise; a void redeal is reported through ``void_deal``
+        (``True``) and ``deal_outcome="void_tie"`` on the otherwise non-terminal
+        step it happens.
         """
         outcome = self._scored_this_step
         if outcome is None:
@@ -428,6 +468,7 @@ class DominoEnv(gym.Env):
         return {
             "acting_seat": int(self._acting_seat()),
             "deal_index": int(self._deal_index),
+            "deal_key": int(self._deal_key if outcome is None else self._scored_key),
             "deal_outcome": deal_outcome,
             "void_deal": bool(self._void_this_step) if outcome is None else bool(outcome.void),
             "blocked": None if outcome is None else bool(outcome.blocked),

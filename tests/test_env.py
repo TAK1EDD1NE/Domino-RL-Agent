@@ -243,6 +243,74 @@ def test_determinism_same_seed_and_opponents():
     assert run(123) == run(123)
 
 
+# 8b -------------------------------------------------------------------------
+def test_unseeded_reset_deals_a_fresh_shuffle():
+    """Regression: an unseeded ``reset`` must deal a new shuffle.
+
+    ``reset`` used to rebuild the deal generator from the sticky ``self._seed``,
+    so every episode after the first replayed one identical deal. A vector-env
+    worker auto-resets with ``seed=None`` (SB3's subproc worker), so a whole run
+    trained on a handful of frozen deals: the policy memorised them (entropy ->
+    0, policy/value losses -> 0, a flat reward window) and then scored at
+    random level on the fresh deals ``test.py`` deals.
+    """
+    def deal_key(env: DominoEnv) -> tuple:
+        return tuple(tuple(sorted(hand)) for hand in env._state.hands)
+
+    env = DominoEnv(opponent=RandomAgent(seed=0), seed=0)
+    keys = set()
+    for _ in range(25):
+        env.reset()
+        keys.add(deal_key(env))
+    assert len(keys) >= 20, f"unseeded resets replayed deals: {len(keys)} distinct in 25"
+
+    # reset(seed=...) keeps its contract: same seed reproduces, other seeds differ.
+    env.reset(seed=0)
+    first = deal_key(env)
+    env.reset(seed=1)
+    other = deal_key(env)
+    env.reset(seed=0)
+    assert deal_key(env) == first
+    assert other != first
+
+    # The constructor seed still seeds the first episode reproducibly.
+    a = DominoEnv(opponent=RandomAgent(seed=0), seed=7)
+    b = DominoEnv(opponent=RandomAgent(seed=0), seed=7)
+    a.reset()
+    b.reset()
+    assert deal_key(a) == deal_key(b)
+
+
+# 8c -------------------------------------------------------------------------
+def test_info_deal_key_identifies_the_opening_position():
+    """The per-deal fingerprint the frozen-deal guard is built on.
+
+    A run whose env re-dealt the same shuffle every episode trains on a handful
+    of positions and looks converged (flat window, entropy -> 0). The guard needs
+    a stable id for the deal a step belongs to, not for the position in it.
+    """
+    env = DominoEnv(opponent=RandomAgent(seed=0), seed=0)
+    keys = set()
+    for _ in range(12):
+        _, info = env.reset()
+        key = info["deal_key"]
+        assert isinstance(key, int)
+        while True:                          # constant for every step of the deal
+            _, _, term, trunc, step_info = _step_lowest(env)
+            assert step_info["deal_key"] == key
+            if term or trunc:
+                break
+        keys.add(key)
+    assert len(keys) == 12, "a fresh shuffle must give a new deal key"
+
+    env.reset(seed=5)
+    seeded = env._info()["deal_key"]
+    env.reset(seed=6)
+    assert env._info()["deal_key"] != seeded
+    env.reset(seed=5)
+    assert env._info()["deal_key"] == seeded
+
+
 # 9 ---------------------------------------------------------------------------
 def test_league_wiring_rule_random_and_set_opponent():
     # rule source: the pool hands back the (recording) rule agent for both seats

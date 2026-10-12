@@ -203,6 +203,18 @@ unit-tested exhaustively.
   `deal_index` — reset-scoped, monotonically increasing within an episode.
 * Options: `{"max_deals_per_episode": 1, "opponent": "league"|"self"|"rule"|"random"|"mixed",
   "seed": int}`.
+* Deal randomness: every `reset()` — with or without a `seed` — draws that episode's deal seed
+  from gymnasium's own generator (`self.np_random`), so `reset(seed=X)` reproduces an episode
+  exactly while an unseeded reset deals a fresh shuffle. `info["deal_key"]` is a stable `crc32`
+  fingerprint of the deal's opening position (hands, turn, leader): constant for every step of
+  that deal and reported on the transition that scores it.
+* **Measured lesson (2026-10-12).** Deriving the deal generator from a sticky `env._seed` meant
+  every unseeded auto-reset replayed one deal — and SB3 seeds a vector env exactly once, because
+  every later auto-reset calls `env.reset()` with no seed. Each `SubprocVecEnv` worker then
+  trained on a single frozen deal: 10.2M learner steps bought 4 memorised deals, entropy collapsed
+  to 0.01 nats, and fresh-deal evaluation stayed at 42-45% against the rule bot (overlapping
+  Wilson CIs) with 51-52% against random. An environment whose only variability is gone looks
+  exactly like a converged run, so `deals/distinct_deals_window` (section 9) is now logged.
 
 `domino/agents/` — one small interface `act(state, seat) -> int` with implementations:
 
@@ -301,6 +313,10 @@ training is the PPO update, not opponent inference (see section 14).
   * SB3's own `rollout/ep_rew_mean`, `train/entropy_loss`, `train/policy_gradient_loss`,
     `train/value_loss`, `train/explained_variance`, `time/fps`,
   * custom deal diagnostics: `deals/block_rate`, `deals/void_rate`, `deals/points_per_deal`,
+    `deals/distinct_deals_window` (distinct opening deals inside the logging window — the
+    frozen-deal guard: a full window holding <= 2 distinct deals means the environment is
+    replaying deals and the reward window is memorisation, not skill; the same callback prints a
+    one-off warning to the run log when that happens),
     `deals/win_rate_vs_<opponent>` (rolling).
   Implemented with a `StatsCallback` that reads `info`/`ep_info_buffer` (SB3 reports
   undiscounted episode returns, so this is exact rather than discounted).

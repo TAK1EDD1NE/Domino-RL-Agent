@@ -32,8 +32,10 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from domino.agents import OpponentPool
 from domino.callbacks import (
     CSV_HEADER,
+    DealDiversity,
     EpisodeStatsCallback,
     SnapshotCallback,
+    TAG_DISTINCT_DEALS,
     TAG_TOTAL_REWARD,
     TAG_WINDOW_AVG,
 )
@@ -155,6 +157,43 @@ def test_snapshots_written_pruned_and_delivered_to_pool(short_run):
     assert sorted(pool._snapshot_paths) == sorted(short_run.snapshot.snapshots)
     # The pool can now sample a frozen snapshot opponent.
     assert "snapshot" in pool._available_weights()
+
+
+# 6 ---------------------------------------------------------------------------
+def test_deal_diversity_guard_counts_distinct_deals_and_alarms():
+    """The frozen-deal guard's counting logic.
+
+    A run whose environment re-dealt one shuffle per worker looked converged
+    (reward window flat, entropy -> 0). The guard makes that visible in the run's
+    own diagnostics instead of only under an independent evaluation.
+    """
+    guard = DealDiversity(window=5)
+    assert guard.distinct == 0 and not guard.full
+
+    for _ in range(5):
+        guard.add(7)
+    assert guard.full and guard.distinct == 1 and guard.low_diversity()
+
+    for key in (8, 9, 10, 11, 12):
+        guard.add(key)
+    assert guard.distinct == 5 and not guard.low_diversity()
+
+
+# 7 ---------------------------------------------------------------------------
+def test_stats_callback_logs_deal_diversity(short_run):
+    events = list(short_run.runs_dir.rglob("events.out.tfevents.*"))
+    accumulator = EventAccumulator(str(events[0].parent))
+    accumulator.Reload()
+    assert TAG_DISTINCT_DEALS in set(accumulator.Tags()["scalars"])
+
+    # A healthy run deals a fresh shuffle every episode: a full window holds
+    # many distinct deals (the frozen-deal bug scored <= n_envs here).
+    assert short_run.stats.diversity.distinct > 20, (
+        f"only {short_run.stats.diversity.distinct} distinct deals in the window"
+    )
+    values = [point.value for point in accumulator.Scalars(TAG_DISTINCT_DEALS)]
+    assert values and values[-1] == short_run.stats.diversity.distinct
+    assert short_run.stats.diversity.full
 
 
 # 5 ---------------------------------------------------------------------------
