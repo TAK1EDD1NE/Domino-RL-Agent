@@ -47,24 +47,26 @@ import sys
 from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
-import torch as th
-from sb3_contrib import MaskablePPO
-from stable_baselines3.common.callbacks import CallbackList
-from stable_baselines3.common.utils import LinearSchedule
-from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecEnv, VecMonitor
 
 from domino.agents import OpponentPool
-from domino.callbacks import (
-    CheckpointCallback,
-    EpisodeStatsCallback,
-    SnapshotCallback,
-)
 from domino.config import TrainConfig, apply_overrides, load_config
 from domino.env import DominoEnv
-from domino.policy import DominoMaskablePolicy, param_count, policy_kwargs_for
+
+if TYPE_CHECKING:  # pragma: no cover - annotations only, never imported at runtime
+    from sb3_contrib import MaskablePPO
+    from stable_baselines3.common.vec_env import VecEnv
+
+# NOTE ON IMPORT PLACEMENT (Windows ``spawn``).
+# ``SubprocVecEnv`` re-imports this file in every worker (multiprocessing re-executes the
+# parent's ``__main__`` by path on spawn), so anything imported here is paid *per worker*.
+# Measured: with torch/sb3/pandas/tensorboard at module level each worker held ~800 MiB,
+# which is what pushed an 8-worker run into memory exhaustion on a 14 GiB machine. The
+# heavy imports therefore live inside the functions that need them; the module level stays
+# numpy + the pure-Python engine, and a worker only pays for torch if a snapshot opponent
+# is actually drawn.
 
 # ---- project layout --------------------------------------------------------
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
@@ -128,13 +130,15 @@ def opponent_weights(opponent: str, live_self: bool = False) -> dict[str, float]
     raise ValueError(f"unknown opponent {opponent!r}; choose from {OPPONENT_CHOICES}")
 
 
-def build_vec_env(cfg: TrainConfig, weights: dict[str, float], mix_opponents: bool) -> VecEnv:
+def build_vec_env(cfg: TrainConfig, weights: dict[str, float], mix_opponents: bool) -> "VecEnv":
     """Build the vectorised training environment.
 
     ``--n-envs 1`` uses an in-process :class:`DummyVecEnv` (so the league may
     hold a live learner); any other count uses :class:`SubprocVecEnv` with one
     module-level factory per worker.
     """
+    from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
+
     if cfg.n_envs == 1:
         return DummyVecEnv([partial(make_domino_env, cfg, cfg.seed, weights, mix_opponents)])
     factories = [
@@ -155,8 +159,13 @@ def effective_batch_size(cfg: TrainConfig) -> int:
     return min(int(cfg.batch_size), buffer_size)
 
 
-def build_model(cfg: TrainConfig, vec_env: VecEnv, runs_dir: Path) -> MaskablePPO:
+def build_model(cfg: TrainConfig, vec_env: "VecEnv", runs_dir: Path) -> "MaskablePPO":
     """Construct ``MaskablePPO`` on the project's custom policy and network."""
+    from sb3_contrib import MaskablePPO
+    from stable_baselines3.common.utils import LinearSchedule
+
+    from domino.policy import DominoMaskablePolicy, policy_kwargs_for
+
     return MaskablePPO(
         policy=DominoMaskablePolicy,
         env=vec_env,
@@ -181,6 +190,8 @@ def build_model(cfg: TrainConfig, vec_env: VecEnv, runs_dir: Path) -> MaskablePP
 
 def seed_everything(seed: int) -> None:
     """Seed numpy, torch, ``random`` and the CUDA generator for reproducibility."""
+    import torch as th
+
     seed = int(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -292,6 +303,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the trainer end to end and return a process exit code."""
     args = build_parser().parse_args(argv)
     cfg = resolve_config(args)
+
+    from sb3_contrib import MaskablePPO
+    from stable_baselines3.common.callbacks import CallbackList
+    from stable_baselines3.common.vec_env import VecMonitor
+
+    from domino.callbacks import (
+        CheckpointCallback,
+        EpisodeStatsCallback,
+        SnapshotCallback,
+    )
+    from domino.policy import param_count
 
     runs_dir = RUNS_DIR / cfg.run_name
     results_dir = RESULTS_DIR

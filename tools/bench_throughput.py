@@ -21,8 +21,10 @@ import importlib.util
 import json
 import pathlib
 import platform
+import shutil
 import statistics
 import sys
+import tempfile
 import time
 
 import numpy as np
@@ -136,6 +138,20 @@ def learner_throughput(
     vec_env = train.build_vec_env(cfg, weights, mix_opponents=(opponent == "mixed"))
     model = train.build_model(cfg, vec_env, REPO_ROOT / "runs")
 
+    # A worker only has snapshot opponents once a checkpoint has been written *and*
+    # pushed into its pool: OpponentPool._available_weights() drops the "snapshot"
+    # weight while the pool knows no paths, and renormalises the rest. Skipping this
+    # step is why the first version of this tool reported league == rule-only
+    # (787 vs 782 steps/s): the "league" row was really rule + random.
+    snapshot_dir = pathlib.Path(tempfile.mkdtemp(prefix="bench_snapshots_"))
+    snapshot_paths: list[str] = []
+    if weights.get("snapshot"):
+        from domino.callbacks import SnapshotCallback
+
+        snapper = SnapshotCallback(snapshot_every=10**9, snapshot_dir=snapshot_dir, league_size=1)
+        snapshot_paths = snapper.save(model, step=0, notify=False)
+        vec_env.env_method("refresh_pool", snapshot_paths)
+
     deadline = _Deadline(max_seconds)
 
     class _Stop(BaseCallback):
@@ -150,10 +166,12 @@ def learner_throughput(
     wall = time.perf_counter() - started
     steps_done = int(model.num_timesteps)
     vec_env.close()
+    shutil.rmtree(snapshot_dir, ignore_errors=True)
 
     result: dict[str, object] = {
         "opponent": opponent,
         "weights": weights,
+        "snapshots_in_pool": len(snapshot_paths),
         "n_envs": envs,
         "requested_steps": steps,
         "steps": steps_done,
@@ -187,12 +205,13 @@ def summarise(engine: dict[str, float], learners: list[dict[str, object]]) -> st
         f"{engine['deals_per_second']:.0f} deals/s, {engine['moves_per_second']:.0f} moves/s "
         f"({engine['moves_per_deal']:.1f} moves/deal)",
         "",
-        f"{'opponent':<10}{'envs':>6}{'steps':>9}{'seconds':>10}{'steps/s':>10}",
-        "-" * 45,
+        f"{'opponent':<10}{'envs':>6}{'snaps':>6}{'steps':>9}{'seconds':>10}{'steps/s':>10}",
+        "-" * 51,
     ]
     for row in learners:
         lines.append(
-            f"{str(row['opponent']):<10}{int(row['n_envs']):>6}{int(row['steps']):>9}"
+            f"{str(row['opponent']):<10}{int(row['n_envs']):>6}"
+            f"{int(row.get('snapshots_in_pool', 0)):>6}{int(row['steps']):>9}"
             f"{float(row['seconds']):>10.1f}{float(row['steps_per_second']):>10.0f}"
         )
     rates = [float(row["steps_per_second"]) for row in learners]
