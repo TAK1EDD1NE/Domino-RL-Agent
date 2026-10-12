@@ -16,7 +16,8 @@ import numpy as np
 
 from domino.agents import PolicyAgent, RandomAgent, RuleAgent, RuleWeights
 from domino.engine import Match, new_deal
-from domino.masks import action_index, assert_consistent, decode_action
+from domino.masks import ACTION_DIM, action_index, assert_consistent, decode_action
+from domino.obs import OBS_DIM
 
 
 class _StubModel:
@@ -94,9 +95,9 @@ def test_agent_names_and_policy_wrapper_contract():
     seat = state.turn
     action = policy.act(state, seat)
     assert action in {action_index(t, e) for t, e in state.legal_moves(seat)}
-    assert stub.last_obs.shape == (192,)
+    assert stub.last_obs.shape == (OBS_DIM,)
     assert stub.last_obs.dtype == np.float32
-    assert stub.last_mask.shape == (56,)
+    assert stub.last_mask.shape == (ACTION_DIM,)
     assert stub.last_mask.dtype == np.bool_
     assert stub.last_deterministic is True
 

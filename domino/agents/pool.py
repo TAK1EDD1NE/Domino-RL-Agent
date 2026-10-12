@@ -19,6 +19,16 @@ coherent unit — both of team B's seats get the same opponent by default, and
 randomness flows through an explicit :class:`numpy.random.Generator`, so a
 seeded pool is deterministic. sb3 is imported only when a snapshot is actually
 loaded, never at module import time.
+
+League opponents are **stochastic by default** (``sample_snapshots=True``): the
+``self`` and ``snapshot`` entries sample from the policy distribution
+(``PolicyAgent(deterministic=False)``) instead of always taking the argmax. A
+deterministic snapshot pool is not a league — every past checkpoint collapses to
+a fixed script, the learner overfits that script, and the held-out evaluation
+(which is argmax, see ``test.py``) stops tracking the training opponents. Pass
+``sample_snapshots=False`` to recover the old argmax behaviour explicitly; the
+evaluation path never goes through this pool, so its argmax is unaffected either
+way.
 """
 from __future__ import annotations
 
@@ -76,6 +86,7 @@ class OpponentPool:
         seed: int | None = None,
         max_loaded: int | None = None,
         mix_opponents: bool = False,
+        sample_snapshots: bool = True,
     ) -> None:
         if max_loaded is not None and max_loaded < 1:
             raise ValueError(f"max_loaded must be >= 1, got {max_loaded}")
@@ -86,6 +97,9 @@ class OpponentPool:
         self._rng = np.random.default_rng(seed)
         self._max_loaded = max_loaded
         self.mix_opponents = mix_opponents
+        #: Whether the ``self``/``snapshot`` entries sample instead of taking the
+        #: argmax (default True; see the module docstring for why).
+        self.sample_snapshots = bool(sample_snapshots)
         self._snapshot_paths: list[str] = []
         self._snapshot_cache: "OrderedDict[str, Any]" = OrderedDict()
         if snapshot_paths:
@@ -135,10 +149,17 @@ class OpponentPool:
         self._learner_model = model
 
     def learner_agent(self) -> PolicyAgent:
-        """Wrap the current learner as an agent (the self-play entry)."""
+        """Wrap the current learner as an opponent (the self-play entry).
+
+        Follows :attr:`sample_snapshots`: the returned agent samples from the
+        policy distribution by default, so the pool's ``self`` opponent is
+        stochastic just like its ``snapshot`` opponents.
+        """
         if self._learner_model is None:
             raise ValueError("no learner model is set; call set_learner(model) first")
-        return PolicyAgent(self._learner_model, deterministic=True, name="self")
+        return PolicyAgent(
+            self._learner_model, deterministic=not self.sample_snapshots, name="self"
+        )
 
     # ---- snapshots -----------------------------------------------------
     def refresh_snapshots(self, paths: Sequence[str]) -> None:
@@ -200,8 +221,11 @@ class OpponentPool:
         return self._snapshot_agent(rng)
 
     def _snapshot_agent(self, rng: np.random.Generator) -> PolicyAgent:
+        """Wrap a random frozen checkpoint, sampling unless told otherwise."""
         path = self._snapshot_paths[int(rng.integers(len(self._snapshot_paths)))]
-        return PolicyAgent(self._get_snapshot(path), deterministic=True, name="snapshot")
+        return PolicyAgent(
+            self._get_snapshot(path), deterministic=not self.sample_snapshots, name="snapshot"
+        )
 
     def _get_snapshot(self, path: str) -> Any:
         """Return the (lazily loaded) model for ``path``, evicting the LRU entry."""

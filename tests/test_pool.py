@@ -183,3 +183,59 @@ def test_set_learner_and_learner_agent_wrapping():
     # With a learner attached, the "self" source becomes drawable.
     names = {pool.sample().name for _ in range(50)}
     assert names <= {"self", "rule", "random"}
+
+
+# --------------------------------------------------------------------------- #
+# Stochastic league opponents (the pool samples by default, evaluation argmaxes)
+# --------------------------------------------------------------------------- #
+def test_pool_hands_out_sampling_snapshot_and_self_agents_by_default(tmp_path, monkeypatch):
+    """The league's ``self``/``snapshot`` opponents must sample, not argmax.
+
+    A frozen checkpoint played with ``deterministic=True`` is a fixed script: the
+    learner overfits that one policy and the argmax evaluation stops tracking the
+    training opponents. The pool therefore hands out sampling agents by default.
+    """
+    monkeypatch.setattr(pool_module, "load_policy", lambda path: _DummyModel(path))
+    pool = OpponentPool(
+        weights={"self": 0.5, "snapshot": 0.5},
+        learner_model=_DummyModel("learner"),
+        snapshot_paths=_make_snapshot_files(tmp_path),
+        seed=0,
+    )
+    assert pool.sample_snapshots is True
+
+    assert pool.learner_agent().deterministic is False
+    for _ in range(20):
+        agent = pool.sample()
+        assert agent.name in {"self", "snapshot"}
+        assert isinstance(agent, PolicyAgent)
+        assert agent.deterministic is False, f"{agent.name} opponent must sample"
+
+
+def test_sample_snapshots_false_restores_argmax_opponents(tmp_path, monkeypatch):
+    """``sample_snapshots=False`` is the explicit opt-out back to argmax play."""
+    monkeypatch.setattr(pool_module, "load_policy", lambda path: _DummyModel(path))
+    pool = OpponentPool(
+        weights={"self": 0.5, "snapshot": 0.5},
+        learner_model=_DummyModel("learner"),
+        snapshot_paths=_make_snapshot_files(tmp_path),
+        seed=0,
+        sample_snapshots=False,
+    )
+    assert pool.sample_snapshots is False
+    assert pool.learner_agent().deterministic is True
+    for _ in range(20):
+        agent = pool.sample()
+        assert agent.name in {"self", "snapshot"}
+        assert agent.deterministic is True
+
+
+def test_sample_snapshots_does_not_touch_the_rule_or_random_entries(tmp_path, monkeypatch):
+    """Only the policy entries are made stochastic; the bots are seeded anyway."""
+    monkeypatch.setattr(pool_module, "load_policy", lambda path: _DummyModel(path))
+    pool = OpponentPool(weights={"rule": 0.5, "random": 0.5}, seed=0)
+    names = {pool.sample().name for _ in range(40)}
+    assert names == {"rule", "random"}
+    # Neither bot is a PolicyAgent, so ``sample_snapshots`` cannot leak into them.
+    for _ in range(20):
+        assert not isinstance(pool.sample(), PolicyAgent)
