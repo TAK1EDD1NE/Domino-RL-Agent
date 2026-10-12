@@ -136,6 +136,39 @@ def test_snapshot_lru_holds_at_most_max_loaded_models(tmp_path, monkeypatch):
     assert len(live) <= 3, f"pool held {len(live)} snapshot models, expected at most 3"
 
 
+def test_snapshot_cache_covers_the_whole_league_window_by_default(tmp_path, monkeypatch):
+    """A cache smaller than the sampled window reloads a checkpoint constantly.
+
+    Measured end-to-end: with the league window at ten snapshots and a 3-model
+    cache, the workers reloaded a checkpoint on most snapshot deals, which cost
+    ~4x training throughput (400 vs ~1500 learner steps/s). The default must
+    therefore hold the entire window: after warm-up, no further disk loads.
+    """
+    calls = {"n": 0}
+
+    def loader(path: str) -> _DummyModel:
+        calls["n"] += 1
+        return _DummyModel(path)
+
+    monkeypatch.setattr(pool_module, "load_policy", loader)
+    paths = _make_snapshot_files(tmp_path, n=10)
+    pool = OpponentPool(weights={"snapshot": 1.0}, snapshot_paths=paths, seed=0)
+    assert pool.max_loaded == 10
+
+    assert calls["n"] == 0, "a pool must load snapshots lazily, not eagerly"
+    for _ in range(600):
+        assert pool.sample().name == "snapshot"
+    assert calls["n"] == 10, (
+        f"expected exactly one load per window entry (10) for 600 draws, got {calls['n']}"
+    )
+
+    # a shrinking window still evicts, and a refreshed window loads only the new entry
+    pool.refresh_snapshots(paths[-3:])
+    for _ in range(200):
+        pool.sample()
+    assert calls["n"] == 10, "keeping a path must not reload it"
+
+
 def test_set_learner_and_learner_agent_wrapping():
     pool = OpponentPool(seed=0)
     with pytest.raises(ValueError):
