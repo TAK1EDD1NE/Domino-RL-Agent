@@ -27,7 +27,7 @@ from domino.config import TrainConfig
 from domino.engine import GameState
 from domino.env import DominoEnv
 from domino.masks import ACTION_DIM
-from domino.obs import OBS_DIM, encode
+from domino.obs import OBS_DIM, PRIVILEGED_SLICE, encode
 from domino.policy import (
     DominoFeaturesExtractor,
     DominoMaskablePolicy,
@@ -198,7 +198,7 @@ def test_gradients_reach_every_submodule() -> None:
     env = _make_env()
     model = _make_model(env)
     policy = model.policy
-    extractor = policy.features_extractor
+    extractor = policy.pi_features_extractor
 
     obs_t = th.as_tensor(_collect_observations(env, 8))
     actions, values, log_prob = policy.forward(obs_t)
@@ -211,19 +211,38 @@ def test_gradients_reach_every_submodule() -> None:
         "tile_embedding": extractor.tile_embedding.weight,
         "tile_mlp": extractor.tile_mlp[0].weight,
         "context_mlp": extractor.context_mlp[0].weight,
+        "move_mlp": extractor.move_mlp[0].weight,
+        "move_head": extractor.move_head[0].weight,
         "trunk_layer_1": extractor.trunk[0].weight,
         "trunk_layer_2": extractor.trunk[3].weight,
         "trunk_layer_3": extractor.trunk[6].weight,
         "policy_head": policy.action_net.weight,
         "value_head": policy.value_net.weight,
+        "privileged_value_extractor": policy.vf_features_extractor.net[0].weight,
     }
     for name, param in targets.items():
         assert param.grad is not None, f"{name} received no gradient"
         assert float(param.grad.abs().sum()) > 0.0, f"{name} received an all-zero gradient"
 
-    # No parameter is left without a gradient at all.
+    # Every parameter except the auxiliary belief head gets a PPO gradient: the
+    # belief head is trained by its own auxiliary loss (domino/belief.py).
     for name, param in policy.named_parameters():
+        if name.startswith("belief_head"):
+            continue
         assert param.grad is not None, f"{name} received no gradient"
+
+    # The auxiliary loss must reach the belief head AND the public tower it reads.
+    policy.zero_grad()
+    obs_batch = th.as_tensor(_collect_observations(env, 4))
+    targets_t = obs_batch[:, PRIVILEGED_SLICE]
+    belief_loss = th.nn.functional.binary_cross_entropy_with_logits(
+        policy.predict_beliefs(obs_batch), targets_t
+    )
+    belief_loss.backward()
+    assert policy.belief_head.weight.grad is not None
+    assert float(policy.belief_head.weight.grad.abs().sum()) > 0.0
+    assert extractor.trunk[0].weight.grad is not None
+    assert float(extractor.trunk[0].weight.grad.abs().sum()) > 0.0
 
 
 # ---- 5. cardinality-agnostic pooling ---------------------------------------
@@ -276,12 +295,15 @@ def test_policy_kwargs_for_is_pure_and_complete() -> None:
         "net_arch",
         "activation_fn",
         "ortho_init",
+        "share_features_extractor",
     }
     assert first["features_extractor_class"] is DominoFeaturesExtractor
     assert first["features_extractor_kwargs"] == {"features_dim": FEATURES_DIM}
     assert first["net_arch"] == {"pi": [], "vf": []}
     assert first["activation_fn"] is th.nn.ReLU
     assert first["ortho_init"] is True
+    # v3: the value side must get its own (privileged) extractor.
+    assert first["share_features_extractor"] is False
 
     # Equal but independent: no shared mutable state between calls.
     assert first == second

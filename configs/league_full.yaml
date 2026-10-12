@@ -24,3 +24,8 @@ env:
   opponent: league
   league_size: 10
   seed: 0
+  # v3: 5 deals per episode so the match-score observation features carry signal
+  # (the eval scripts and the UI keep the one-deal contract).
+  max_deals_per_episode: 5
+  # v3 (item 9): league snapshots act stochastically instead of argmax.
+  sample_snapshots: true

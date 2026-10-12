@@ -123,11 +123,20 @@ def _kinds(matchup: str) -> tuple[str, str]:
     return a, b
 
 
-def _make_agent(kind: str, model: object | None, seed: int) -> Agent:
+def _make_agent(kind: str, model: object | None, seed: int, search_k: int = 0) -> Agent:
     """Build one agent of the requested kind."""
     if kind == "rl":
         if model is None:
             raise ValueError("matchup needs a trained model; pass --model")
+        if search_k > 0:
+            # v3 item 5: PIMC root selection with the trained value net as the leaf
+            # evaluator. Deterministic and seeded, so an A/B against the plain policy
+            # runs on identical deals.
+            from domino.search import PIMCPolicyAgent, value_fn_from_model
+
+            return PIMCPolicyAgent(
+                value_fn_from_model(model), n_determinizations=int(search_k), seed=seed
+            )
         return PolicyAgent(model, deterministic=True, name="rl")  # type: ignore[arg-type]
     if kind == "rule":
         return RuleAgent(seed=seed)
@@ -141,10 +150,11 @@ def _build_agents(matchup: str, args: argparse.Namespace) -> tuple[dict[int, Age
     a_kind, b_kind = _kinds(matchup)
     model_a = load_policy(args.model) if a_kind == "rl" else None
     model_b = load_policy(args.model_b or args.model) if b_kind == "rl" else None
+    search_k = int(getattr(args, "search", 0) or 0)
     agents: dict[int, Agent] = {}
     a_seats, b_seats = (TEAM_A_SEATS, TEAM_B_SEATS) if not args.swap else (TEAM_B_SEATS, TEAM_A_SEATS)
     for seat in a_seats:
-        agents[seat] = _make_agent(a_kind, model_a, seed=args.seed + seat)
+        agents[seat] = _make_agent(a_kind, model_a, seed=args.seed + seat, search_k=search_k)
     for seat in b_seats:
         agents[seat] = _make_agent(b_kind, model_b, seed=args.seed + 100 + seat)
     return agents, a_kind, b_kind
@@ -312,6 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0, help="base RNG seed")
     parser.add_argument("--swap", action="store_true",
                         help="put agent A on team 1 (seats 1 and 3) instead of team 0")
+    parser.add_argument("--search", type=int, default=0,
+                        help="PIMC determinizations for agent A's policy (0 = plain policy; "
+                             "v3 item 5, needs a centralised value net)")
     parser.add_argument("--out", default=None,
                         help="CSV path (default results/eval_<timestamp>.csv)")
     parser.add_argument("--quiet", action="store_true", help="suppress the printed table")

@@ -14,6 +14,7 @@ legally distinct unless the ends carry the same value.
 from __future__ import annotations
 
 import copy
+import functools
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -78,6 +79,15 @@ class GameState:
     deal_no: int = 1
     scores: list[int] = field(default_factory=lambda: [0, 0])
     forced_leader_six_six: bool = False
+    #: Global ordered move history of this deal: ``(seat, tile_id, end_index)``
+    #: appended by :meth:`play`. Order is information the agent needs for
+    #: signalling/blocking patterns, which the ``played_by`` blocks cannot carry.
+    moves: list[tuple[int, int, int]] = field(default_factory=list)
+    #: Per seat, the pip values that seat is *known* to lack, inferred from its
+    #: forced passes (a pass means "no tile with either open-end value"). Hands
+    #: only shrink in this game (no boneyard), so a lack is monotone: once a
+    #: value is known to be absent it never comes back.
+    lacks: list[set[int]] = field(default_factory=lambda: [set() for _ in range(SEATS)])
 
     # ---- construction -------------------------------------------------
     def clone(self) -> "GameState":
@@ -95,6 +105,8 @@ class GameState:
             deal_no=self.deal_no,
             scores=list(self.scores),
             forced_leader_six_six=self.forced_leader_six_six,
+            moves=list(self.moves),
+            lacks=[set(values) for values in self.lacks],
         )
 
     # ---- queries ------------------------------------------------------
@@ -124,34 +136,47 @@ class GameState:
     def must_pass(self, seat: int) -> bool:
         return not legal_actions(self, seat)
 
+    def _tile_placements(self, tid: int) -> list[tuple[int, list[int]]]:
+        """Deduplicated ``(end_index, new_ends)`` placements for ``tid``.
+
+        Thin wrapper over the cached :func:`_placements_cached`: the cache is keyed
+        by ``(tile, open ends)`` and returns tuples, so the lists are rebuilt here
+        (never handed out by reference, which would let a caller corrupt the cache).
+        """
+        return [
+            (e, list(new_ends))
+            for e, new_ends in GameState._placements_cached(tid, tuple(self.ends))
+        ]
+
+
     def blocks(self) -> bool:
         return self.pass_streak >= SEATS
 
     def is_terminal(self) -> bool:
         return self.blocks() or any(len(h) == 0 for h in self.hands) or len(self.table) == NUM_TILES
 
-    # ---- placement helper ---------------------------------------------
-    def _tile_placements(self, tid: int) -> list[tuple[int, list[int]]]:
-        """Return deduplicated ``(end_index, new_ends)`` placements for ``tid``.
+    @staticmethod
+    @functools.lru_cache(maxsize=8192)
+    def _placements_cached(tid: int, ends: tuple[int, int]) -> tuple[tuple[int, tuple[int, ...]], ...]:
+        """Deduplicated placements of ``tid`` on ``ends``, cached by ``(tid, ends)``.
 
-        The board must be non-empty. Placements that produce the same position
-        (attaching to two ends that carry the same value) collapse to the lower
-        end index, so no duplicate move is ever exposed.
+        The board has at most 49 distinct open-end pairs, so this removes almost all
+        placement recomputation from the hot loop of ``legal_moves`` (v3 item 8,
+        measured as the cheapest engine-side win). Placements that produce the same
+        position (attaching to two ends carrying the same value) collapse to the lower
+        end index, so no duplicate move is ever exposed (v3 item 7).
         """
         a, b = tile_values(tid)
-        candidates: list[tuple[int, list[int]]] = []
+        candidates: list[tuple[int, tuple[int, ...]]] = []
         for e in (0, 1):
-            target = self.ends[e]
+            target = ends[e]
             if target != a and target != b:
                 continue
-            if a == b:
-                new_value = a
-            else:
-                new_value = b if target == a else a
-            new_ends = list(self.ends)
+            new_value = a if a == b else (b if target == a else a)
+            new_ends = list(ends)
             new_ends[e] = new_value
-            candidates.append((e, new_ends))
-        placements: list[tuple[int, list[int]]] = []
+            candidates.append((e, tuple(new_ends)))
+        placements: list[tuple[int, tuple[int, ...]]] = []
         seen: set[tuple[int, ...]] = set()
         for e, new_ends in candidates:
             key = tuple(sorted(new_ends))
@@ -159,7 +184,7 @@ class GameState:
                 continue
             seen.add(key)
             placements.append((e, new_ends))
-        return placements
+        return tuple(placements)
 
     # ---- transitions --------------------------------------------------
     def play(self, seat: int, tid: int, end: int = 0) -> None:
@@ -189,6 +214,7 @@ class GameState:
         self.hands[seat].remove(tid)
         self.table.append(tid)
         self.played_by[seat].append(tid)
+        self.moves.append((int(seat), int(tid), int(end)))
         self.ends = new_ends
         self.pass_streak = 0
         self.last_pass[seat] = False
@@ -197,11 +223,17 @@ class GameState:
         self.turn = (seat + 1) % SEATS
 
     def pass_turn(self, seat: int) -> None:
-        """Record a forced pass; illegal when a legal tile exists in hand."""
+        """Record a forced pass; illegal when a legal tile exists in hand.
+
+        A pass is public proof that this seat holds no tile carrying either open
+        end value, so both values are added to :attr:`lacks` (monotone: hands only
+        shrink in a no-boneyard game).
+        """
         if seat != self.turn:
             raise ValueError("out of turn pass")
         if not self.must_pass(seat):
             raise ValueError("mandatory play violated: passing with a legal tile in hand")
+        self.lacks[seat].update(int(value) for value in self.ends)
         self.pass_streak += 1
         self.last_pass[seat] = True
         self.turn = (seat + 1) % SEATS

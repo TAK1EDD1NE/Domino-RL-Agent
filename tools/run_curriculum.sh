@@ -26,7 +26,7 @@ echo "=== curriculum start $(date -Is) ===" >> "$LOG"
 run_stage () {           # name steps opponent fresh|resume
     local name="$1" steps="$2" opponent="$3" mode="$4"
     local -a cmd=(uv run python -u train.py --config configs/league_full.yaml
-                  --steps "$steps" --n-envs 4 --device cpu --run-name "$name"
+                  --steps "$steps" --n-envs 6 --device cpu --run-name "$name"
                   --set "env.opponent=$opponent")
     if [ "$mode" = "resume" ]; then
         cmd+=(--resume)
@@ -41,8 +41,12 @@ run_stage () {           # name steps opponent fresh|resume
     echo "EVAL_${name}_EXIT=$?" >> "$LOG"
 }
 
-run_stage stage1_random_v2 1000000  random fresh
-run_stage stage2_rule_v2   5000000  rule   resume
-run_stage stage3_league_v2 10000000 league resume
+# v3 chain: the observation layout, centralised critic, belief head, ordered moves,
+# match features, stochastic league and entropy floor are all in from the start
+# (docs/plans/2026-10-12-v3-architecture-plan.md). Stage 1 must start FRESH: the v2
+# checkpoints cannot be loaded by v3 code (observation space 192 -> 507).
+run_stage stage1_random_v3 1000000  random fresh
+run_stage stage2_rule_v3   5000000  rule   resume
+run_stage stage3_league_v3 10000000 league resume
 
 echo "=== curriculum done $(date -Is) ===" >> "$LOG"

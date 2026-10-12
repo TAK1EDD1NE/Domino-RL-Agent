@@ -100,7 +100,14 @@ def make_domino_env(
     across processes (see the module docstring on vectorised league semantics).
     """
     env_cfg = replace(cfg.env, seed=int(seed), opponent_weights=dict(weights))
-    pool = OpponentPool(weights=dict(weights), seed=int(seed), mix_opponents=bool(mix_opponents))
+    pool = OpponentPool(
+        weights=dict(weights),
+        seed=int(seed),
+        mix_opponents=bool(mix_opponents),
+        # v3 league hygiene: snapshots sample instead of argmax, so the opponent
+        # mix is a distribution rather than one deterministic script.
+        sample_snapshots=bool(cfg.env.sample_snapshots),
+    )
     # Snapshot opponents are loaded lazily inside this worker; MaskablePPO.load
     # works natively on the pinned SB3 2.7.1 (no torch.load shim needed).
     return DominoEnv(opponent=pool, env_cfg=env_cfg, seed=int(seed))
@@ -308,11 +315,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     from stable_baselines3.common.callbacks import CallbackList
     from stable_baselines3.common.vec_env import VecMonitor
 
+    from domino.belief import BeliefHeadCallback
     from domino.callbacks import (
         CheckpointCallback,
         EpisodeStatsCallback,
         SnapshotCallback,
     )
+    from domino.league import EntropyFloorCallback
     from domino.policy import param_count
 
     runs_dir = RUNS_DIR / cfg.run_name
@@ -377,6 +386,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         checkpoint_cb = CheckpointCallback(
             checkpoint_every=cfg.checkpoint_every, checkpoint_dir=checkpoint_dir
         )
+        callbacks = [stats_cb, snapshot_cb, checkpoint_cb]
+        if cfg.belief_enabled:
+            callbacks.append(
+                BeliefHeadCallback(
+                    coef=cfg.belief_coef,
+                    lr=cfg.belief_lr,
+                    batch_size=cfg.belief_batch,
+                    every=cfg.belief_every,
+                )
+            )
+            print(f"Aux belief head: coef={cfg.belief_coef}, lr={cfg.belief_lr}, "
+                  f"batch={cfg.belief_batch}, every={cfg.belief_every} (shapes the public trunk)")
+        if cfg.entropy_floor_enabled:
+            callbacks.append(
+                EntropyFloorCallback(
+                    min_entropy=cfg.min_entropy,
+                    floor=cfg.entropy_floor,
+                    base_ent_coef=cfg.ent_coef,
+                )
+            )
+            print(f"Entropy floor: ent_coef >= {cfg.entropy_floor} while entropy < {cfg.min_entropy} nats")
 
         # Seed the league with an initial snapshot *before* training so the pool
         # always has at least one frozen opponent to sample from.
@@ -386,7 +416,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         model.learn(
             total_timesteps=int(cfg.total_steps),
             reset_num_timesteps=not resume,
-            callback=CallbackList([stats_cb, snapshot_cb, checkpoint_cb]),
+            callback=CallbackList(callbacks),
             tb_log_name=cfg.run_name,
         )
         model.save(str(checkpoint_dir / "latest.zip"))

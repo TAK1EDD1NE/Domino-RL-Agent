@@ -28,7 +28,13 @@ class EnvConfig:
     )
     league_size: int = 10
     seed: int = 0
+    #: Deals per training episode. 1 = the original one-deal episode contract used
+    #: by the evaluation scripts and the UI; the training preset
+    #: (configs/league_full.yaml) sets 5 so the match-score features carry signal.
     max_deals_per_episode: int = 1
+    #: League hygiene (v3 item 9): draw snapshot opponents stochastically instead of
+    #: argmax, so the opponent mix is a distribution rather than a fixed script.
+    sample_snapshots: bool = True
 
 
 @dataclass
@@ -52,6 +58,24 @@ class TrainConfig:
     snapshot_every: int = 100_000
     seed: int = 0
     env: EnvConfig = field(default_factory=EnvConfig)
+    # ---- v3 architecture (docs/plans/2026-10-12-v3-architecture-plan.md) -------
+    #: Auxiliary belief head (item 3): supervised ownership prediction of the hidden
+    #: hands from the public trunk features.
+    belief_enabled: bool = True
+    belief_coef: float = 0.5          # weight applied to the belief BCE loss
+    belief_lr: float = 3e-4           # its own optimiser's learning rate
+    belief_batch: int = 256           # observations sampled from the rollout buffer
+    #: Auxiliary updates every N rollout steps. Measured on this box: every=1 costs
+    #: 3x throughput (376 vs 1164 steps/s with 6 workers), so the default trades
+    #: shaping frequency for compute (an update every N*6 env steps).
+    belief_every: int = 8
+    #: Entropy floor (item 9): raise ent_coef back to the floor when the logged
+    #: policy entropy drops under min_entropy nats, relax when it recovers.
+    entropy_floor_enabled: bool = True
+    entropy_floor: float = 0.05
+    min_entropy: float = 0.1
+    #: PIMC determinisations at inference (item 5); 0 disables search.
+    search_k: int = 0
 
 
 @dataclass
