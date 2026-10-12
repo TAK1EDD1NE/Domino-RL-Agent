@@ -1,0 +1,166 @@
+"""Typed configuration objects shared by train/test/play/observe.
+
+Every entry point (training, evaluation, the Pygame UI) reads its parameters from
+these dataclasses. ``load_config``/``save_config`` provide a YAML round-trip and
+``apply_overrides`` implements the CLI ``--set key=value`` passthrough, coercing each
+value to the type of the existing dataclass field and rejecting unknown keys.
+"""
+from __future__ import annotations
+
+import dataclasses
+import pathlib
+from dataclasses import asdict, dataclass, field
+from typing import Any, Iterable
+
+import yaml
+
+REWARD_MODES: frozenset[str] = frozenset({"differential", "banked"})
+
+
+@dataclass
+class EnvConfig:
+    n_seats: int = 4
+    learner_seats: tuple[int, ...] = (0, 2)
+    reward_mode: str = "differential"      # "differential" | "banked"
+    opponent: str = "league"               # "league" | "self" | "rule" | "random" | "mixed"
+    opponent_weights: dict[str, float] = field(
+        default_factory=lambda: {"self": 0.5, "snapshot": 0.2, "rule": 0.2, "random": 0.1}
+    )
+    league_size: int = 10
+    seed: int = 0
+    max_deals_per_episode: int = 1
+
+
+@dataclass
+class TrainConfig:
+    run_name: str = "league_full"
+    total_steps: int = 100_000_000
+    n_envs: int = 8
+    n_steps: int = 512
+    batch_size: int = 2048
+    n_epochs: int = 10
+    gamma: float = 0.99
+    gae_lambda: float = 0.95
+    clip_range: float = 0.2
+    ent_coef: float = 0.01
+    learning_rate: float = 3e-4
+    vf_coef: float = 0.5
+    max_grad_norm: float = 0.5
+    target_kl: float = 0.02
+    device: str = "auto"
+    checkpoint_every: int = 500_000
+    snapshot_every: int = 100_000
+    seed: int = 0
+    env: EnvConfig = field(default_factory=EnvConfig)
+
+
+@dataclass
+class EvalConfig:
+    deals_per_matchup: int = 1000
+    match_to: int = 100
+    seed: int = 0
+    model_path: str = "models/checkpoints/latest.zip"
+    out_dir: str = "results"
+
+
+_BOOL_TRUE = {"1", "true", "yes", "on"}
+_BOOL_FALSE = {"0", "false", "no", "off"}
+
+
+def _validate_env(env: EnvConfig) -> None:
+    """Reject an unknown ``reward_mode`` (the only validated field for now)."""
+    if env.reward_mode not in REWARD_MODES:
+        raise ValueError(
+            f"reward_mode must be one of {sorted(REWARD_MODES)}, got {env.reward_mode!r}"
+        )
+
+
+def _coerce_value(current: Any, value: Any) -> Any:
+    """Coerce ``value`` to the type of ``current`` (bool before int, exact for the rest)."""
+    if isinstance(current, bool):
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in _BOOL_TRUE:
+            return True
+        if text in _BOOL_FALSE:
+            return False
+        raise ValueError(f"cannot parse boolean from {value!r}")
+    if isinstance(current, int):
+        return int(value)
+    if isinstance(current, float):
+        return float(value)
+    if isinstance(current, str):
+        return str(value)
+    if isinstance(current, tuple):
+        return tuple(value)
+    if isinstance(current, list):
+        return list(value)
+    if isinstance(current, dict):
+        return dict(value)
+    return value
+
+
+def _build_dataclass(cls: type, data: dict[str, Any]) -> Any:
+    """Instantiate ``cls`` from a mapping, coercing nested dataclasses and types."""
+    field_names = {f.name for f in dataclasses.fields(cls)}
+    unknown = set(data) - field_names
+    if unknown:
+        raise ValueError(f"unknown configuration key(s) for {cls.__name__}: {sorted(unknown)}")
+    base = cls()
+    kwargs: dict[str, Any] = {}
+    for f in dataclasses.fields(cls):
+        if f.name not in data:
+            continue
+        raw = data[f.name]
+        if f.name == "env" and isinstance(raw, dict):
+            kwargs[f.name] = _build_dataclass(EnvConfig, raw)
+        else:
+            kwargs[f.name] = _coerce_value(getattr(base, f.name), raw)
+    return cls(**kwargs)
+
+
+def load_config(path: str | pathlib.Path) -> TrainConfig:
+    """Load a :class:`TrainConfig` from a YAML file (nested ``env:`` mapping supported)."""
+    raw = yaml.safe_load(pathlib.Path(path).read_text(encoding="utf-8")) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"configuration file {path!s} must contain a mapping")
+    cfg = _build_dataclass(TrainConfig, raw)
+    _validate_env(cfg.env)
+    return cfg
+
+
+def save_config(cfg: TrainConfig, path: str | pathlib.Path) -> None:
+    """Write ``cfg`` to ``path`` as YAML (round-trips through :func:`load_config`)."""
+    path = pathlib.Path(path)
+    if path.parent and not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(asdict(cfg), sort_keys=False), encoding="utf-8")
+
+
+def apply_overrides(cfg: TrainConfig, pairs: Iterable[str]) -> TrainConfig:
+    """Apply ``"key=value"`` overrides in place, coercing to the field's type.
+
+    Dotted keys address nested configuration, e.g. ``env.reward_mode=banked``. Unknown
+    field names raise :class:`ValueError`.
+    """
+    for pair in pairs:
+        key, sep, raw = str(pair).partition("=")
+        if not sep or not key:
+            raise ValueError(f"override must be of the form key=value, got {pair!r}")
+        _assign(cfg, key.split("."), raw)
+    _validate_env(cfg.env)
+    return cfg
+
+
+def _assign(cfg: Any, parts: list[str], raw: str) -> None:
+    obj = cfg
+    for name in parts[:-1]:
+        if not hasattr(obj, name):
+            raise ValueError(f"unknown configuration section: {'.'.join(parts)}")
+        obj = getattr(obj, name)
+    field_name = parts[-1]
+    if not hasattr(obj, field_name):
+        raise ValueError(f"unknown configuration field: {'.'.join(parts)}")
+    current = getattr(obj, field_name)
+    setattr(obj, field_name, _coerce_value(current, raw))

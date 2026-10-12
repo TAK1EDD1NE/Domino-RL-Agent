@@ -1,0 +1,26 @@
+# Long-run league preset (spec sections 8-9): the 100-300 M step budget the
+# report recommends. 8 vector workers on 12 logical cores, league self-play via
+# frozen snapshots, checkpoints every 500k steps, snapshots every 100k steps.
+run_name: league_full
+total_steps: 100_000_000
+n_envs: 8
+n_steps: 512
+batch_size: 2048
+n_epochs: 10
+gamma: 0.99
+gae_lambda: 0.95
+clip_range: 0.2
+ent_coef: 0.01
+learning_rate: 0.0003
+vf_coef: 0.5
+max_grad_norm: 0.5
+target_kl: 0.02
+device: auto
+checkpoint_every: 500_000
+snapshot_every: 100_000
+seed: 0
+env:
+  reward_mode: differential
+  opponent: league
+  league_size: 10
+  seed: 0

@@ -4,9 +4,9 @@
 
 **Goal:** Build the complete RLOC-2026/2027 deliverable — a 2v2 domino rules engine, a Gymnasium environment, a MaskablePPO agent with a custom set-encoder network trained by league self-play, a documented rule-based baseline, Pygame interactive/observation modes, an evaluation pipeline, and the report artefacts — in `C:\Users\pc\Desktop\tp\rl\project`.
 
-**Architecture:** A pure-Python deterministic rules engine (`domino/engine.py`) is wrapped by a Gymnasium env (`domino/env.py`) that exposes the *learner team's* decision points only (opponent seats are played internally by an `OpponentPool`), with a seat-relative 192-dim public-information observation, a masked `Discrete(28)` action space and deal-terminal point rewards. `sb3-contrib` `MaskablePPO` trains it with a custom two-tower network. Pygame lives only in `domino/ui/` and is never imported by training code.
+**Architecture:** A pure-Python deterministic rules engine (`domino/engine.py`) is wrapped by a Gymnasium env (`domino/env.py`) that exposes the *learner team's* decision points only (opponent seats are played internally by an `OpponentPool`), with a seat-relative 192-dim public-information observation, a masked `Discrete(56)` `(tile, end)` action space and deal-terminal point rewards. `sb3-contrib` `MaskablePPO` trains it with a custom two-tower network. Pygame lives only in `domino/ui/` and is never imported by training code.
 
-**Tech Stack:** Python 3.12, uv (pyproject + uv.lock), gymnasium 1.4, torch 2.5.1+cu121, stable-baselines3 2.9.0a2, sb3-contrib 2.8.0, pygame 2.6.1, tensorboard 2.21, pandas 3.0, matplotlib 3.11, pytest 9.1.
+**Tech Stack:** Python 3.12, uv (pyproject + uv.lock), gymnasium 1.2.3, torch 2.5.1+cu121, stable-baselines3 2.7.1, sb3-contrib 2.7.1, pygame 2.6.1, tensorboard 2.21, pandas 3.0, matplotlib 3.11, pytest 9.1.
 
 **Spec:** `docs/specs/2026-10-11-domino-2v2-rl-design.md` — the plan implements this spec; executors read both.
 
@@ -15,7 +15,7 @@
 - Python `>=3.12,<3.13`; every command runs through `uv run …` from the project root; `uv.lock` must stay in sync (`uv sync --locked` passes).
 - Mandatory root file names (assignment): `train.py`, `test.py`, `play.py`, `observe.py`, `evaluate.ipynb`, `README.md`. Root scripts are thin CLIs; logic lives in the package.
 - Training path must never import `pygame`. UI modules are imported only by `play.py` / `observe.py` / UI tests.
-- Observation is exactly `192` floats (`float32`), layout fixed by spec section 4. Action space is exactly `Discrete(28)`, tile ids by `id(a,b) = a*7 + b - a*(a+1)/2`, `a<=b`.
+- Observation is exactly `192` floats (`float32`), layout fixed by spec section 4. Action space is exactly `Discrete(56)` = `2 * tile_id + end_index` (`0 = left`, `1 = right`) over tile ids `id(a,b) = a*7 + b - a*(a+1)/2`, `a<=b`; the move set is deduplicated when both placements produce the same position.
 - Rewards are raw points, no per-step shaping, no scaling; only the terminal transition is non-zero. Team of the learner = seats `{0,2}`; team B = seats `{1,3}`.
 - The engine is deterministic given a seed and has no global mutable state; every random draw goes through an explicit `numpy.random.Generator`.
 - Windows: `SubprocVecEnv` requires `if __name__ == "__main__":`; pygame tests set `SDL_VIDEODRIVER=dummy`.
@@ -231,8 +231,9 @@ git add -A && git commit -m "feat(domino): tile identity table, typed configs, p
 - Consumes: `domino.tiles`.
 - Produces:
   - `@dataclass class GameState`: fields `hands: list[list[int]]` (4 sorted tile-id lists), `table: list[int]` (tiles in play order), `played_by: list[list[int]]` (per seat, tile ids in play order), `ends: list[int]` (0-2 open end values: index 0 = "left", 1 = "right"), `turn: int`, `leader: int`, `pass_streak: int`, `last_pass: list[bool]`, `deal_no: int`, `scores: list[int]` (per team, length 2), `rng: np.random.Generator`, `forced_leader_six_six: bool`.
-    Methods: `clone() -> GameState`, `blocks() -> bool`, `legal_actions(seat:int)->list[int]`, `must_pass(seat:int)->bool`, `play(seat:int, tid:int)->None`, `pass_turn(seat:int)->None`, `team_of(seat:int)->int`, `pips(seat:int)->int`, `hand_size(seat:int)->int`, `table_pips()->int`, `unseen_tiles()->set[int]`.
+    Methods: `clone() -> GameState`, `blocks() -> bool`, `legal_moves(seat:int)->list[tuple[int,int]]`, `legal_actions(seat:int)->list[int]`, `must_pass(seat:int)->bool`, `play(seat:int, tid:int, end:int=0)->None`, `pass_turn(seat:int)->None`, `team_of(seat:int)->int`, `pips(seat:int)->int`, `hand_size(seat:int)->int`, `table_pips()->int`, `unseen_tiles()->set[int]`.
   - `def new_deal(*, deal_no:int, rng:np.random.Generator, lead_mode:str="six_six"|"winner", leader:int|None=None) -> GameState`
+  - `def legal_moves(state:GameState, seat:int) -> list[tuple[int,int]]` — `(tile_id, end_index)` placements, deduplicated
   - `def legal_actions(state:GameState, seat:int) -> list[int]` (module-level alias of the method, for tests)
 
 - [ ] **Step 1: Write the failing test** — `tests/test_engine_rules.py`
@@ -430,9 +431,9 @@ class GameState:
             raise ValueError(f"tile {tid} is not playable on ends {self.ends}")
         self.hands[seat].remove(tid)
         a, b = tile_values(tid)
-        if not self.table:                       # opening lead: both ends become the tile's values
+        if not self.table:                       # free lead: the line exposes the tile's two values
             self.table.append(tid)
-            self.ends = ([a] if a == b else [a, b])
+            self.ends = [a, b]                    # a double leads to two equal ends, e.g. [6, 6]
         elif a == b:                             # double: end value is unchanged
             if a == self.ends[0]:
                 pass
@@ -795,7 +796,7 @@ def test_describe_observation_covers_all_192_dims():
 
 **Files:** Create `domino/masks.py`, `tests/test_masks.py`
 
-**Interfaces:** Produces `ACTION_DIM: int = 28`, `def action_mask(state: GameState, seat: int) -> np.ndarray` (bool array shape (28,), `np.bool_`), `def masked_actions(mask) -> np.ndarray`, `def assert_consistent(state, seat, action)`.
+**Interfaces:** Produces `ACTION_DIM: int = 56`, `def action_index(tid: int, end: int) -> int` (= `2*tid+end`), `def decode_action(action: int) -> tuple[int,int]`, `def action_mask(state: GameState, seat: int) -> np.ndarray` (bool array shape (56,), `np.bool_`, built from `engine.legal_moves`), `def masked_actions(mask) -> np.ndarray`, `def assert_consistent(state, seat, action)`.
 
 - [ ] **Step 1: Failing test** — mask equals `legal_actions`, always non-empty at a decision point, forced `[6|6]` lead mask is a single `True`, illegal action raises through `assert_consistent`.
 - [ ] **Step 2/3/4:** implement + pass + **commit** `feat(masks): action masking over the 28 tile ids`.
@@ -808,7 +809,7 @@ def test_describe_observation_covers_all_192_dims():
 
 **Interfaces:**
 - Consumes: Tasks 2-5, `domino/agents/`.
-- Produces: `class DominoEnv(gym.Env)`, `__init__(self, opponent: Agent | OpponentPool | None = None, env_cfg: EnvConfig | None = None, seed: int | None = None)`; attributes `observation_space` (`Box(0, 1, (192,), float32)`), `action_space` (`Discrete(28)`); methods `reset(seed=None, options=None) -> (np.ndarray, dict)`, `step(action) -> (obs, reward, terminated, truncated, info)`, `action_masks() -> np.ndarray`, `state` property, `acting_seat` property, `set_opponent(obj)`, `render(mode="human")` (delegates to `domino.ui.render` lazily). Registered as `gymnasium.register("Domino2v2-v0", entry_point="domino.env:DominoEnv")` in `domino/__init__.py`.
+- Produces: `class DominoEnv(gym.Env)`, `__init__(self, opponent: Agent | OpponentPool | None = None, env_cfg: EnvConfig | None = None, seed: int | None = None)`; attributes `observation_space` (`Box(0, 1, (192,), float32)`), `action_space` (`Discrete(56)`); methods `reset(seed=None, options=None) -> (np.ndarray, dict)`, `step(action) -> (obs, reward, terminated, truncated, info)`, `action_masks() -> np.ndarray`, `state` property, `acting_seat` property, `set_opponent(obj)`, `render(mode="human")` (delegates to `domino.ui.render` lazily). Registered as `gymnasium.register("Domino2v2-v0", entry_point="domino.env:DominoEnv")` in `domino/__init__.py`.
 
 - [ ] **Step 1: Failing test** — `tests/test_env.py`
 
@@ -826,7 +827,7 @@ def test_spaces_and_reset():
     obs, info = env.reset(seed=0)
     assert env.observation_space.shape == (OBS_DIM,)
     assert obs.shape == (OBS_DIM,) and obs.dtype == np.float32
-    assert env.action_space.n == 28
+    assert env.action_space.n == 56
     assert env.acting_seat in (0, 2)          # only learner seats produce decisions
     assert info["acting_seat"] == env.acting_seat
 
@@ -836,7 +837,7 @@ def test_mask_is_never_empty_at_a_decision_point(draws=50):
     env.reset(seed=1)
     for _ in range(draws):
         mask = env.action_masks()
-        assert mask.dtype == np.bool_ and mask.shape == (28,)
+        assert mask.dtype == np.bool_ and mask.shape == (56,)
         assert mask.sum() >= 1
         legal = env.state.legal_actions(env.acting_seat)
         assert sorted(np.flatnonzero(mask).tolist()) == sorted(legal)
@@ -922,7 +923,7 @@ def test_gymnasium_api_check():
 
 **Interfaces:** `class DominoFeaturesExtractor(BaseFeaturesExtractor)` (features_dim=128, set encoder + context tower as in spec section 7), `class DominoMaskablePolicy(MaskableActorCriticPolicy)` (LayerNorm trunk, orthogonal init, gain √2, `net_arch`-free), `def policy_kwargs_for(cfg: TrainConfig) -> dict` (returns `{"features_extractor_class": DominoFeaturesExtractor, "features_extractor_kwargs": {...}}`).
 
-- [ ] **Step 1: Failing test** — building `MaskablePPO(DominoMaskablePolicy, env, policy_kwargs=policy_kwargs_for(cfg))` works; `param_count(model) < 2_000_000`; forward pass on a batch of 8 obs returns action shapes `(8, 28)` unmasked and `(8,)` masked; masked logits of illegal actions are `-inf`; the sampled action is legal for 200 random states; every submodule receives gradient after one `train()` call; the extractor is cardinality-agnostic (works on hands of size 1 and 7).
+- [ ] **Step 1: Failing test** — building `MaskablePPO(DominoMaskablePolicy, env, policy_kwargs=policy_kwargs_for(cfg))` works; `param_count(model) < 2_000_000`; forward pass on a batch of 8 obs returns action shapes `(8, 56)` unmasked and `(8,)` masked; masked logits of illegal actions are `-inf`; the sampled action is legal for 200 random states; every submodule receives gradient after one `train()` call; the extractor is cardinality-agnostic (works on hands of size 1 and 7).
 - [ ] **Step 2/3/4/5:** implement, pass, commit `feat(policy): custom two-tower set-encoder network and MaskablePPO policy`.
 
 ---

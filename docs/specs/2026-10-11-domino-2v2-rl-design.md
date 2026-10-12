@@ -39,6 +39,14 @@ Algerian/Maghrebi 2v2 domino ("domino", not the draw variant).
 * Doubles: mechanically identical to any other tile — playing `[3|3]` on a 3-end leaves the
   3-end open. There is no obligation to "close" a double and no extra end is created.
   Rendering only differs (doubles are drawn crosswise, section 11).
+* The line exposes exactly **two ends**. A tile is placed on one of them, and the ends are the
+  outer pip values of the line: after a free lead of `[a|b]` the ends are `a` and `b` (both `a`
+  when the lead is a double).
+* A move is therefore a pair **(tile, end)**. When a tile matches both ends the two placements are
+  legally distinct and can lead to different positions (ends `[3,5]` with the tile `[3|5]` in hand:
+  attaching to the 3-end leaves `[5,5]`, attaching to the 5-end leaves `[3,3]`). The engine
+  enumerates both; when the two placements are equivalent (the ends carry the same value) only one
+  is kept, so no duplicate move is ever exposed.
 * Passing: a player **must** play a legal tile if they hold one. A pass is legal only when
   the player holds no tile matching either open end.
 * Block: the deal is blocked when the last **four consecutive turns were all passes**
@@ -77,8 +85,9 @@ reported.
   information plus the acting seat's own hand (section 4). It is *seat-relative*: the same
   vector layout describes the situation from the point of view of whichever controlled seat
   is about to act, so one network can play both seats.
-* **Action**: an integer in `Discrete(28)` — the tile id played (section 5).
-* **Action mask**: a 28-dimensional boolean vector; `False` for any tile that is not in the
+* **Action**: an integer in `Discrete(56)` encoding the move `(tile, end)`: `action = 2 tile_id + end`
+  with `end ∈ {0 = left, 1 = right}` (section 5).
+* **Action mask**: a 56-dimensional boolean vector; `False` for any tile that is not in the
   acting seat's hand or is not playable on either open end (and, when leading, any tile not
   in hand). Whether the acting seat can play at all is decided by the engine: a turn with no
   legal tile is a **forced pass and is not a decision point** for the agent (there is no
@@ -87,6 +96,8 @@ reported.
   (`+` sum of the opponents' remaining pips, `0` on a void deal, `0` for every non-terminal
   transition). Rewards are **raw points, undiscounted, no shaping** — the assignment's
   convergence metric (total reward per episode) is then directly "points per deal".
+  Reward mode is configurable (`differential` default | `banked`); the environment applies it,
+  the engine always reports the points banked by the winning team (see addendum A).
 * **Discount**: `gamma = 0.99` by default (exposed as a CLI flag; 1.0 is defensible for a
   finite-horizon episodic task and is discussed in the report). SB3's advantage
   normalisation handles the reward magnitude (returns are order 10-60 points), which is why
@@ -141,15 +152,19 @@ imported everywhere; the mapping is a unit test.
 
 ## 5. Action space and masking
 
-* `gym.spaces.Discrete(28)`; action = tile id to play.
-* The engine exposes `legal_actions(state) -> set[int]` for the acting seat: tiles in hand
-  matching either open end; all hand tiles when the board is empty; the singleton `{id(6,6)}`
-  for the forced opening lead of deal 1 and of a redeal after a void deal.
-* `action_masks()` returns a `np.bool_` array of length 28 from that set, which is exactly the
-  interface `MaskablePPO` expects. Illegal logits are set to `-inf` by SB3.
+* `gym.spaces.Discrete(56)`; `action = 2 * tile_id + end_index`, where `end_index` is
+  `0 = left end`, `1 = right end`. A lead (empty board) uses `end_index = 0` only.
+* The engine exposes `legal_moves(state, seat) -> list[tuple[int, int]]` — `(tile_id, end_index)`
+  pairs for every placement that is legal, deduplicated when the two placements would produce the
+  same position — plus the tile-level convenience view `legal_actions(state, seat) -> list[int]`
+  used by the rule bot, the Pygame UI and the diagnostics. Tiles that match no open end are never
+  listed; the forced opening lead of deal 1 (and of a redeal after a void deal) yields exactly the
+  one move `(id(6,6), 0)`.
+* `action_masks()` returns a `np.bool_` array of length 56 built from `legal_moves`, which is
+  exactly the interface `MaskablePPO` expects. Illegal logits are set to `-inf` by SB3.
 * Pass actions are **not** in the action space (see section 3).
 * Invariant enforced by a test: `mask.sum() >= 1` at every decision point, and the sampled
-  action is always in `legal_actions`.
+  action is always in `legal_moves`.
 
 ---
 
@@ -184,7 +199,8 @@ unit-tested exhaustively.
   reward is returned; otherwise the next learner decision point is returned.
 * `action_masks()` for the acting learner seat.
 * `info` carries per-deal diagnostics used by logging and evaluation: `deal_winner`,
-  `deal_points`, `blocked`, `void_deal`, `deal_steps`, `deals_played`, `match_scores`.
+  `deal_points`, `blocked`, `void_deal`, `deal_steps`, `deals_played`, `match_scores`;
+  `deal_index` — reset-scoped, monotonically increasing within an episode.
 * Options: `{"max_deals_per_episode": 1, "opponent": "league"|"self"|"rule"|"random"|"mixed",
   "seed": int}`.
 
@@ -214,7 +230,7 @@ trunk  : concat(128 + 256 = 384)
                        -> Linear 384->256, LayerNorm, ReLU
                        -> Linear 256->256, LayerNorm, ReLU
                        -> Linear 256->128, LayerNorm, ReLU      -> 128 features
-heads  : SB3 policy head Linear(128->28)  (masked at sampling time)
+heads  : SB3 policy head Linear(128->56)  (masked at sampling time)
          SB3 value  head Linear(128->1)
 ```
 
@@ -305,14 +321,18 @@ Scoring of each legal move (higher is better), with default weights:
 
 | term | weight | intent |
 |------|--------|--------|
-| pips shed (value of the tile) | +1.0 | get heavy tiles out of your hand, they are what you lose on a block |
-| kills a value (after the move, that end's value is dead table-wide) | +3.0 | strangle the table, force passes |
-| end value the opponents are short of | +2.0 | make them draw from a shrinking set |
+| pips shed (value of the tile) | +0.5 | get heavy tiles out of your hand, they are what you lose on a block |
+| kills a value (after the move, that end's value is dead table-wide) | +9.0 | strangle the table, force passes |
+| end value the opponents are short of | +6.0 | make them draw from a shrinking set |
 | keeps my doubles in hand | +0.5 | doubles are the most flexible tiles, useful as end-switchers later |
 | protects the partner (does not open a value the partner is short of) | +1.5 | team play: do not hand the partner an impossible end |
 | reduces my expected loss on a future block (`my_pips` vs table minimum) | +2.0 | if a block looks close, become the lowest-pip player |
 | leading a value I hold a duplicate of | +1.5 | keeps both ends available |
 | forced opening `[6|6]` | n/a | the only legal move in deal 1's lead |
+
+These weights were chosen by the documented sweep `tools/sweep_rule_weights.py` (coordinate
+ascent against a random opponent on evaluation seeds disjoint from the win-rate gate's), not
+by hand; the previous hand-chosen values were `+1.0 / +3.0 / +2.0 / +0.5 / +1.5 / +2.0 / +1.5`.
 
 Block-awareness: if `sum(live) <= 12` or the pass streak is ≥ 2, the "reduce my expected loss"
 and "kills a value" terms are doubled, because the deal is likely to end blocked and the
@@ -338,8 +358,10 @@ run); training never imports pygame.
   `--model models/checkpoints/latest.zip`, `--seed`, `--match-to 100`.
 * Board rendered as a single line; doubles drawn crosswise (perpendicular) exactly as on a
   physical table, with a small gap marker so the line stays readable.
-* Legal tiles highlighted, illegal ones dimmed; clicking a tile plays it; a "pass" indicator is
-  shown automatically when the human is stuck (mandatory-play rule).
+* Legal tiles highlighted, illegal ones dimmed; clicking a tile with a single legal placement plays it
+  immediately, while clicking an ambiguous one (matching both ends) highlights both target ends and the
+  second click chooses the end; a "pass" indicator is shown automatically when the human is stuck
+  (mandatory-play rule).
 * Info panel: hands' tile counts, table ends, pass streak, remaining points, deal and match
   scores, and a text line reporting the last action of each AI seat.
 * Buttons/keys: new deal, restart match, toggle AI autoplay for the human seat (useful for a
@@ -381,13 +403,15 @@ Metrics (each justified in the report):
 5. **Mean pips left in hand at deal end** — measures efficiency in the blocked endgame
    specifically.
 6. **Decision latency (ms/action)** — inference cost, relevant for the interactive mode.
-7. **Sample efficiency**: deals needed to reach 50 % win rate vs the rule bot (from the
-   training CSV) — the classic RL comparison axis.
+7. **Sample efficiency** — reframed during implementation: the training log records per-episode
+   reward, not periodic head-to-head results, so this axis is presented as the convergence curve
+   (total reward per episode against steps) in `evaluate.ipynb` rather than as a fabricated
+   win-rate series. Periodic in-training evaluation is listed as future work in section 15.
 
 Outputs: one row per (matchup, seed-batch) in `results/eval_<timestamp>.csv` with a fixed
 schema (matchup, agent_a, agent_b, deals, wins_a, wins_b, win_rate_a, ci_low, ci_high,
-points_per_deal_a, points_per_deal_b, block_rate, void_rate, match_win_rate_a, ms_per_action,
-model_path, seed). `evaluate.ipynb` reads the CSVs and produces: convergence curve (total
+points_per_deal_a, points_per_deal_b, match_win_rate_a, matches_played, block_rate, void_rate,
+mean_pips_left_a, ms_per_action, model_path, seed). `evaluate.ipynb` reads the CSVs and produces: convergence curve (total
 reward per episode with the 100-deal window average), win-rate-vs-training-steps curve, metric
 bar charts with error bars, the metric table, and the ablation table.
 
@@ -433,37 +457,53 @@ started, since the training budget is the owner's decision.
 
 ---
 
-## 14. Training-time estimate
+## 14. Training-time estimate (measured)
 
-Method: measure, do not guess. `tools/bench_throughput.py` measures (a) raw engine
-steps/second single-process, (b) end-to-end learner steps/second with 8 `SubprocVecEnv`
-workers and the league active, (c) PPO update time per rollout batch, (d) GPU utilisation.
-Results go to `runs/benchmark.json` and the table below is replaced by the measured numbers
-before any budget decision is taken.
+Method: measure, do not guess. `tools/bench_throughput.py` measures the raw engine's
+deals/second with no learning machinery, the end-to-end learner steps/second with the real
+vectorised environment (8 `SubprocVecEnv` workers, PPO updates and league opponents), and the
+peak CUDA allocation. Results are written to `runs/benchmark.json`.
 
-Preliminary arithmetic (to be replaced):
+Measured on the development machine (Windows 11, 12 logical CPUs, RTX 3060 Laptop 6 GB,
+torch 2.5.1+cu121, stable-baselines3/sb3-contrib 2.7.1, gymnasium 1.2.3):
 
-* The policy has ~0.3 M parameters and the observation is 192-dim, so gradient work is trivial
-  for an RTX 3060 Laptop (6 GB) — memory is not a constraint and the GPU is not the bottleneck.
-* The bottleneck is the Python env: the engine is pure Python with precomputed legal moves,
-  so expect roughly 3 000-15 000 learner steps/s per worker, i.e. **~25 000-120 000 steps/s
-  aggregate with 8 workers** (minus 10-25 % for league opponent inference).
-* One deal is ~20-30 raw moves, so ~10-14 learner decisions; 1 M learner steps ≈ 80 000-100 000
-  deals.
+| measurement | result |
+|---|---|
+| raw engine, rule/random seats, no gym and no PPO | ~180-208 deals/s, ~4 900-5 600 moves/s (27 moves/deal) |
+| end-to-end learner, 8 envs, rule opponents | 782 steps/s |
+| end-to-end learner, 8 envs, league opponents (snapshots present) | 787-802 steps/s |
+| policy parameters | 251 641 |
+| peak CUDA allocation | in `runs/benchmark.json` |
 
-| steps (learner) | aggregate 25 k steps/s | aggregate 60 k steps/s | aggregate 120 k steps/s |
-|-----------------|------------------------|------------------------|-------------------------|
-| 10 M            | ~6.7 min               | ~2.8 min               | ~1.4 min                |
-| 30 M            | ~20 min                | ~8.3 min               | ~4.2 min                |
-| 100 M           | ~67 min                | ~28 min                | ~14 min                 |
-| 300 M           | ~3.3 h                 | ~83 min                | ~42 min                 |
+The league's opponent inference is **not** the bottleneck: with snapshots on disk the league
+run matches the rule-only run. The gap between the raw engine (~5 600 moves/s) and the learner
+(~800 steps/s, about 100 steps/s per worker) is per-step Python work -- observation encoding,
+the Gymnasium wrapper, the action mask, subprocess IPC and the PPO update.
 
-Convergence expectation: with masking, a 0.3 M-parameter net, terminal deal-level rewards and a
-league of opponents, a first competent policy (beats random decisively, competitive with the
-strong rule bot) should appear in the 10-50 M step range; beating the rule bot reliably is
-plausible in the 50-300 M range. Budget recommendation: plan a 100-300 M step run (~15 min to
-3.3 h at the measured rate, single overnight run at worst) instead of an open-ended one, and
-keep checkpoints every 500 k steps so any stopping point is usable.
+Extrapolated wall clock at the measured ~800 steps/s:
+
+| learner steps | wall clock |
+|---------------|-----------|
+| 10 M | ~3.5 h |
+| 30 M | ~10.5 h |
+| 100 M | ~35 h |
+| 300 M | ~105 h |
+
+**This replaces the preliminary estimate in the first draft of this spec, which assumed
+25 000-120 000 steps/s and was wrong by about two orders of magnitude.** The error was in the
+per-step cost, not in the step budget: the engine is fast, the learning loop is not.
+
+Convergence expectation: with action masking, a 0.25 M-parameter network, terminal deal-level
+rewards and a league of opponents, a first competent policy (decisively better than random,
+competitive with the rule bot) should appear in the 10-50 M step range, and reliably beating
+the rule bot in the 50-300 M range.
+
+Budget recommendation: one 10-30 M step run (~3.5-10.5 h, a single overnight session) with
+checkpoints every 500 k steps, then evaluate; extend only while the win-rate curve is still
+rising. Cheap levers if more throughput is wanted, in order of expected gain: raise `--n-envs`
+towards the core count; cache the observation encoder's per-value liveness table across steps;
+prefer a snapshot-only opponent mix (the rule bot's per-move scoring pass is the most expensive
+per-decision opponent).
 
 ---
 
@@ -474,6 +514,8 @@ keep checkpoints every 500 k steps so any stopping point is usable.
 * A3 architecture: custom set encoder vs a default SB3 MLP of similar size.
 * A4 `gamma` 0.99 vs 1.0.
 * A5 opponent mixing within a deal.
+* A6 reward mode: `differential` (default) vs `banked`.
+* A7 rule-bot weight sweep: hand-chosen defaults vs swept weights (tool: tools/sweep_rule_weights.py).
 Not to be run unless the training budget allows; the harness supports them from day one
 because they are config values, not code branches.
 
