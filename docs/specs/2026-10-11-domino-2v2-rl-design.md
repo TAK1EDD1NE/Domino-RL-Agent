@@ -263,13 +263,20 @@ The learner always occupies team A's two seats. Team B is drawn per deal from an
 * Snapshots are written every `--snapshot-every` PPO updates (default: every 100 000 env
   steps) to `models/snapshots/policy_<steps>.zip`; the pool keeps the newest 10.
 * Workers are notified with `vec_env.env_method("refresh_pool")` on an SB3 callback; each
-  worker loads snapshots lazily and caches at most 3 models (they are tiny).
+  worker loads snapshots lazily and caches the **whole league window** (10 models, ~2 MB each).
+  A smaller cache is measurably wrong: the pool samples uniformly over the window, so a
+  3-model cache misses on ~70 % of snapshot deals and reloads a checkpoint from disk inside
+  every worker -- measured at 400 vs ~1500 learner steps/s end-to-end, i.e. ~4x slower
+  training. `OpponentPool(max_loaded=int)` still bounds the cache when explicitly asked.
 * A deal is a coherent unit: both of team B's seats use the same opponent type by default
   (`--mix-opponents` allows per-seat mixing for an ablation).
 * `--opponent self` reproduces pure mirror self-play (section 15 ablation A1).
 
-Known cost: opponent inference runs on CPU inside the vector workers and lowers throughput by
-roughly 10-25 % versus mirror-only self-play; measured in the throughput benchmark.
+Known cost: opponent inference runs on CPU inside the vector workers. Measured on the
+development machine with the window full (10 snapshots) and the cache covering it, the league
+mix runs at the same rate as a rule-only mix; the earlier "league is free" reading was taken
+when the window held a single snapshot, which hid the reload cost above. The dominant cost of
+training is the PPO update, not opponent inference (see section 14).
 
 ---
 

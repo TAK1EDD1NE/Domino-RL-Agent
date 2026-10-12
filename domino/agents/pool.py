@@ -6,7 +6,9 @@ interface:
 
 * ``self``   — the current learner policy (mirror self-play, the main engine);
 * ``snapshot`` — a frozen checkpoint, sampled uniformly from the known paths and
-  loaded lazily through an LRU cache holding at most ``max_loaded`` models;
+  loaded lazily through a cache holding the whole league window by default (see
+  :attr:`OpponentPool.max_loaded`: a cache smaller than the window misses on most
+  draws and reloads a checkpoint from disk per deal, which measured ~4x slower);
 * ``rule``   — the documented rule-based baseline;
 * ``random`` — the uniform-random agent (cheap diversity).
 
@@ -72,17 +74,17 @@ class OpponentPool:
         snapshot_paths: Sequence[str] | None = None,
         rule_agent: Agent | None = None,
         seed: int | None = None,
-        max_loaded: int = 3,
+        max_loaded: int | None = None,
         mix_opponents: bool = False,
     ) -> None:
-        if max_loaded < 1:
+        if max_loaded is not None and max_loaded < 1:
             raise ValueError(f"max_loaded must be >= 1, got {max_loaded}")
         self._weights = _normalised_weights(weights)
         self._learner_model = learner_model
         self._rule_agent: Agent = rule_agent if rule_agent is not None else RuleAgent(seed=seed)
         self._seed = seed
         self._rng = np.random.default_rng(seed)
-        self.max_loaded = max_loaded
+        self._max_loaded = max_loaded
         self.mix_opponents = mix_opponents
         self._snapshot_paths: list[str] = []
         self._snapshot_cache: "OrderedDict[str, Any]" = OrderedDict()
@@ -90,6 +92,22 @@ class OpponentPool:
             self.refresh_snapshots(snapshot_paths)
 
     # ---- sampling ------------------------------------------------------
+    @property
+    def max_loaded(self) -> int:
+        """Effective snapshot cache size.
+
+        ``None`` (the default) means "hold the whole league window": the pool
+        samples uniformly over ``snapshot_paths``, so a cache *smaller* than that
+        window misses on most draws and reloads a checkpoint from disk inside
+        every worker -- measured at ~4x slower end-to-end training (400 vs 1500
+        learner steps/s) once the window had grown to ten snapshots. Pass an int
+        to bound the cache explicitly (the smaller-cache eviction behaviour is
+        still exercised by the tests).
+        """
+        if self._max_loaded is not None:
+            return int(self._max_loaded)
+        return max(1, len(self._snapshot_paths))
+
     @property
     def weights(self) -> dict[str, float]:
         """The configured (renormalised, positive) source weights."""
