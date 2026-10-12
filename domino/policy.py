@@ -344,8 +344,18 @@ class DominoMaskablePolicy(MaskableActorCriticPolicy):
         blocks of 28 (opponents in ``[left, partner, right]`` order). The public
         extractor is called directly because sb3-contrib's ``extract_features``
         returns ``(features, action_masks)`` on this policy.
+
+        Accepts a numpy array or a tensor on any device and moves the batch to the
+        policy's own device (with ``--device auto`` on a CUDA box the extractor is on
+        ``cuda:0``, so a CPU batch would otherwise raise a device mismatch).
         """
-        features = self.pi_features_extractor(observations)
+        if th.is_tensor(observations):
+            obs = observations.to(device=self.device, dtype=th.float32)
+        else:
+            obs = th.as_tensor(
+                np.asarray(observations), dtype=th.float32, device=self.device
+            )
+        features = self.pi_features_extractor(obs)
         return self.belief_head(features)
 
 

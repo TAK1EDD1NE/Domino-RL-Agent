@@ -35,9 +35,16 @@ run_stage () {           # name steps opponent fresh|resume
     "${cmd[@]}" >> "$LOG" 2>&1
     echo "STAGE_${name}_EXIT=$?" >> "$LOG"
 
-    uv run python -u test.py --model models/checkpoints/latest.zip \
-        --matchups rl_vs_rule,rl_vs_random --deals 400 --matches 1 --quiet \
-        --out "results/eval_${name}.csv" >> "$LOG" 2>&1
+    # Evaluation: 5 seeds x 400 deals, pooled, so the number the report quotes has a
+    # Wilson CI and a between-seed spread instead of one noisy single-seed sample.
+    for s in 0 1 2 3 4; do
+        uv run python -u test.py --model models/checkpoints/latest.zip \
+            --matchups rl_vs_rule,rl_vs_random --deals 400 --matches 1 --quiet \
+            --seed "$s" --out "results/eval_${name}_seed${s}.csv" >> "$LOG" 2>&1
+        echo "EVAL_${name}_seed${s}_EXIT=$?" >> "$LOG"
+    done
+    uv run python -u "$HOME/AppData/Local/hermes/skills/rl-training-verification/scripts/aggregate_seeds.py" \
+        "results/eval_${name}_seed*.csv" >> "$LOG" 2>&1
     echo "EVAL_${name}_EXIT=$?" >> "$LOG"
 }
 

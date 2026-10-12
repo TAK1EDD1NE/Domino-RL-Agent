@@ -318,3 +318,22 @@ def test_policy_kwargs_for_is_pure_and_complete() -> None:
 
     # ``cfg`` is optional and currently architecture-neutral.
     assert policy_kwargs_for() == policy_kwargs_for(TrainConfig())
+
+
+# ---- 7. belief predictions follow the policy's device ----------------------
+def test_belief_predictions_accept_numpy_and_move_to_the_policy_device() -> None:
+    """Regression: with --device auto the extractor sits on cuda:0 but the belief
+    callback samples numpy observations, which raised "Expected all tensors to be on
+    the same device" and killed the trainer inside the callback.
+    """
+    env = _make_env(seed=0)
+    model = _make_model(env)
+    device = model.policy.device
+    batch = _collect_observations(env, 4)
+
+    from_numpy = model.policy.predict_beliefs(batch)
+    from_tensor = model.policy.predict_beliefs(th.as_tensor(batch, dtype=th.float32))
+    assert from_numpy.shape == (4, PRIVILEGED_SLICE.stop - PRIVILEGED_SLICE.start)
+    assert from_tensor.shape == from_numpy.shape
+    assert from_numpy.device == device and from_tensor.device == device
+    assert th.allclose(from_numpy, from_tensor, atol=1e-5)

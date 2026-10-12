@@ -99,10 +99,23 @@ class BeliefHeadCallback(BaseCallback):
         pos = int(getattr(buffer, "pos", 0))
         if pos < 1:
             return True
-        raw = np.asarray(buffer.observations)[:pos].reshape(-1, OBS_DIM)
-        count = min(self.batch_size, raw.shape[0])
-        index = self._rng.integers(0, raw.shape[0], size=count)
-        observations = th.as_tensor(raw[index], dtype=th.float32)
+        # Work on the buffer's own tensors: ``buffer.observations`` is shaped
+        # (buffer_size, n_envs, obs_dim) and ``pos`` counts the steps added so far, so
+        # the auxiliary update runs during collection instead of only at the rollout
+        # boundary. (``buffer.get`` is a minibatch *generator* here.)  Indexing the
+        # tensor keeps this correct on cuda buffers too, where np.asarray would raise.
+        raw = buffer.observations[:pos].reshape(-1, OBS_DIM)
+        # A CPU rollout buffer stores numpy arrays, a cuda buffer stores torch tensors:
+        # normalise first, then index (np.asarray on a cuda tensor would raise, and a
+        # numpy array has no .detach()/.to(device=...)).
+        if not th.is_tensor(raw):
+            raw = th.as_tensor(np.asarray(raw), dtype=th.float32)
+        count = min(self.batch_size, int(raw.shape[0]))
+        index = th.as_tensor(self._rng.integers(0, int(raw.shape[0]), size=count))
+        # The auxiliary input must live on the policy's device: with --device auto on a
+        # CUDA box the extractor is on cuda:0 and a CPU batch raises a device mismatch.
+        device = th.device(getattr(self.model.policy, "device", "cpu"))
+        observations = raw[index].to(device=device, dtype=th.float32).detach()
         targets = observations[:, PRIVILEGED_SLICE]
         logits = self.model.policy.predict_beliefs(observations)
         loss = th.nn.functional.binary_cross_entropy_with_logits(logits, targets) * self.coef
