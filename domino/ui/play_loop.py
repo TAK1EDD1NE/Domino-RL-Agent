@@ -290,6 +290,19 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
                     banner = f"seat {seat} ({agent.name}) to move" if not cfg.autoplay else banner
                 next_ai_move = time.monotonic() + cfg.ai_delay
 
+        # Your seat is subject to the same mandatory-play rule as the AI: when you
+        # have no playable tile the pass is forced, so the loop must take it for
+        # you instead of waiting for a click that can never come (the deal used to
+        # stall here). The short pause is so the reason is readable on screen.
+        elif (running and not cfg.autoplay and state.turn == cfg.human_seat
+                and not state.is_terminal() and state.must_pass(cfg.human_seat)
+                and time.monotonic() >= next_ai_move):
+            state.pass_turn(cfg.human_seat)
+            cfg.last_actions.append("you: pass (stuck)")
+            pending_tile = None
+            banner = "no playable tile — you pass (the rules force it)"
+            next_ai_move = time.monotonic() + cfg.ai_delay
+
         if state.is_terminal():
             outcome = deal_outcome(state)
             if outcome.void:

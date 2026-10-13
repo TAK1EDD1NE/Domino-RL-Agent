@@ -212,3 +212,41 @@ def test_the_delay_is_configurable_from_the_cli():
     finally:
         play.run_play = original
     assert seen["cfg"].ai_delay == 1.25
+
+
+# --------------------------------------------------------------------------- #
+# A stuck human seat must not freeze the deal
+# --------------------------------------------------------------------------- #
+def test_your_seat_passes_itself_when_it_is_stuck():
+    """Reported: "the game stops when I can't play, it should skip me".
+
+    Seed 31 makes seat 1 (the human's seat) unplayable on its first turn, so the
+    loop has to take the forced pass itself -- waiting for a click that can never
+    come left the deal frozen forever.
+    """
+    cfg = PlayConfig(human_seat=1, partner="rule", opponents="rule", seed=31,
+                     fps=0, ai_delay=0.0)
+    run_play(cfg, max_frames=400)
+    actions = cfg.last_actions
+    forced = [index for index, line in enumerate(actions) if "you: pass" in line]
+    assert forced, f"your seat never took its forced pass: {actions}"
+    # the deal carried on: the AI kept moving after the pass instead of stalling
+    assert len(actions) > forced[0] + 2, actions
+
+
+def test_your_seat_does_not_pass_when_it_has_a_legal_tile():
+    """A soft check that the auto-pass cannot fire for a playable seat."""
+    cfg = PlayConfig(human_seat=1, partner="rule", opponents="rule", seed=0,
+                     fps=0, ai_delay=0.0)
+    run_play(cfg, max_frames=200)
+    assert cfg.last_actions, "the loop should have played something"
+    assert not [line for line in cfg.last_actions if "you: pass" in line], cfg.last_actions
+
+
+def test_a_stuck_seat_in_autoplay_is_passed_as_before():
+    """With autoplay the human seat is an agent, so the AI path takes the pass."""
+    cfg = PlayConfig(human_seat=1, partner="rule", opponents="rule", seed=31,
+                     autoplay=True, fps=0, ai_delay=0.0)
+    run_play(cfg, max_frames=400)
+    assert not [line for line in cfg.last_actions if "you: pass" in line]
+    assert any("pass (stuck)" in line for line in cfg.last_actions), cfg.last_actions
