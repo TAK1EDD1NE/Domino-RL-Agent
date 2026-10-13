@@ -16,6 +16,16 @@
 # Usage:  bash tools/run_curriculum.sh [log-path]
 set -u
 
+# Resolve uv explicitly. One invocation of the stages-2-3 launcher from a shell whose PATH
+# lacked the Hermes bin dir died with a bare "uv: command not found" and still wrote
+# STAGE_*/EVAL_*_EXIT=127 markers, i.e. it looked like a finished stage with a failure code.
+# Prepend the known location and abort loudly if uv is genuinely missing.
+for _dir in "$HOME/AppData/Local/hermes/bin" "$HOME/.local/bin" "$HOME/.cargo/bin"; do
+    [ -d "$_dir" ] && PATH="$_dir:$PATH"
+done
+export PATH
+command -v uv >/dev/null 2>&1 || { echo "ERROR: uv not found on PATH; refusing to start." >&2; exit 127; }
+
 PROJECT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT"
 LOG="${1:-runs/logs/curriculum_v2.log}"
