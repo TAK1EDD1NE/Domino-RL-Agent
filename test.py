@@ -77,6 +77,9 @@ MATCHUPS: tuple[str, ...] = (
     "rl_vs_rl",
     "rule_vs_rule",
     "random_vs_random",
+    "pimc_vs_rule",
+    "pimc_vs_random",
+    "pimc_vs_rl",
 )
 
 TEAM_A_SEATS: tuple[int, int] = (0, 2)
@@ -124,7 +127,8 @@ def _kinds(matchup: str) -> tuple[str, str]:
     return a, b
 
 
-def _make_agent(kind: str, model: object | None, seed: int, search_k: int = 0) -> Agent:
+def _make_agent(kind: str, model: object | None, seed: int, search_k: int = 0,
+                args: argparse.Namespace | None = None) -> Agent:
     """Build one agent of the requested kind."""
     if kind == "rl":
         if model is None:
@@ -139,6 +143,21 @@ def _make_agent(kind: str, model: object | None, seed: int, search_k: int = 0) -
                 value_fn_from_model(model), n_determinizations=int(search_k), seed=seed
             )
         return PolicyAgent(model, deterministic=True, name="rl")  # type: ignore[arg-type]
+    if kind == "pimc":
+        # Phase 3 of the search brief: sampled-world PIMC over the belief sampler, with the
+        # exact/heuristic solver as the world evaluator.
+        from domino.pimc import PIMCAgent
+
+        worlds = int(getattr(args, "pimc_worlds", 32) or 32)
+        horizon = int(getattr(args, "pimc_horizon", 10) or 0)
+        budget = float(getattr(args, "pimc_budget", 1.0) or 1.0)
+        leaf = str(getattr(args, "pimc_leaf", "blocked_now") or "blocked_now")
+        method = str(getattr(args, "pimc_sampler", "auto") or "auto")
+        opponent_model = str(getattr(args, "pimc_opponent_model", "min") or "min")
+        opponent_policy = RuleAgent(seed=seed) if opponent_model == "policy" else None
+        return PIMCAgent(worlds=worlds, horizon=horizon, time_budget=budget, leaf_eval=leaf,
+                         method=method, seed=seed, opponent_model=opponent_model,
+                         opponent_policy=opponent_policy)
     if kind == "rule":
         return RuleAgent(seed=seed)
     if kind == "random":
@@ -155,9 +174,10 @@ def _build_agents(matchup: str, args: argparse.Namespace) -> tuple[dict[int, Age
     agents: dict[int, Agent] = {}
     a_seats, b_seats = (TEAM_A_SEATS, TEAM_B_SEATS) if not args.swap else (TEAM_B_SEATS, TEAM_A_SEATS)
     for seat in a_seats:
-        agents[seat] = _make_agent(a_kind, model_a, seed=args.seed + seat, search_k=search_k)
+        agents[seat] = _make_agent(a_kind, model_a, seed=args.seed + seat, search_k=search_k,
+                                   args=args)
     for seat in b_seats:
-        agents[seat] = _make_agent(b_kind, model_b, seed=args.seed + 100 + seat)
+        agents[seat] = _make_agent(b_kind, model_b, seed=args.seed + 100 + seat, args=args)
     return agents, a_kind, b_kind
 
 
@@ -326,6 +346,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--search", type=int, default=0,
                         help="PIMC determinizations for agent A's policy (0 = plain policy; "
                              "v3 item 5, needs a centralised value net)")
+    parser.add_argument("--pimc-worlds", type=int, default=32, dest="pimc_worlds",
+                        help="sampled worlds per decision for the 'pimc' agent kind")
+    parser.add_argument("--pimc-horizon", type=int, default=10, dest="pimc_horizon",
+                        help="ply horizon of the solver inside 'pimc' (exact once short)")
+    parser.add_argument("--pimc-budget", type=float, default=1.0, dest="pimc_budget",
+                        help="wall-clock seconds per 'pimc' decision")
+    parser.add_argument("--pimc-leaf", default="blocked_now", dest="pimc_leaf",
+                        help="leaf estimate of the inner search: blocked_now | pip_diff")
+    parser.add_argument("--pimc-sampler", default="auto", dest="pimc_sampler",
+                        help="belief sampler: auto | rejection | constrained")
+    parser.add_argument("--pimc-opponent-model", default="min", dest="pimc_opponent_model",
+                        help="opponents inside the tree: min (pessimistic) | policy (rule bot)")
     parser.add_argument("--out", default=None,
                         help="CSV path (default results/eval_<timestamp>.csv)")
     parser.add_argument("--quiet", action="store_true", help="suppress the printed table")
