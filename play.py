@@ -8,11 +8,14 @@ value stays open.
 Each of the three AI seats can be given its own agent with a repeatable
 ``--agent SEAT=KIND[:CHECKPOINT]``, so you can face, for example, the 15M network
 on one side and the rule bot on the other while the 4M network partners you.
+``--ai-delay`` slows the AI down so you can follow the deal (its panel shows how
+many tiles each player has left, never which ones).
 
 Examples
 --------
     uv run python play.py --partner rl --opponents rl
     uv run python play.py --partner rule --opponents random --human-seat 3
+    uv run python play.py --ai-delay 1.5 --agent 2=rule
     uv run python play.py --agent 3=rl:models/checkpoints/ppo_4001502_steps.zip \\
         --agent 0=rl:models/checkpoints/ppo_15002766_steps.zip --agent 2=rule
 """
@@ -66,6 +69,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--match-to", type=int, default=100, dest="match_to",
                         help="match target in points")
     parser.add_argument("--fps", type=int, default=30, help="frame rate")
+    parser.add_argument("--ai-delay", type=float, default=0.7, dest="ai_delay",
+                        help="seconds the AI waits between its moves (0 = as fast as possible)")
     parser.add_argument("--autoplay", action="store_true",
                         help="let the AI play your seat too (demo mode)")
     return parser
@@ -89,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         match_to=args.match_to,
         fps=args.fps,
+        ai_delay=args.ai_delay,
         autoplay=args.autoplay,
         seat_agents=seat_agents,
     )

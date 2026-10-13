@@ -15,7 +15,7 @@ import os
 
 import pygame
 
-from ..engine import GameState, PARTNER_OF_SEAT, TEAM_OF_SEAT
+from ..engine import GameState, TEAM_OF_SEAT
 from ..tiles import tile_pips, tile_values
 from .board import (
     PANEL_W,
@@ -236,16 +236,19 @@ class Renderer:
             ("", TEXT),
         ]
         for seat in range(4):
-            marker = "->" if seat == acting_seat else "  "
-            partner = PARTNER_OF_SEAT[seat]
-            who = "you" if seat == human_seat else (seat_labels or {}).get(seat, "")
             lines.append(
                 (
-                    f"{marker} seat {seat}  {state.hand_size(seat)}t {state.pips(seat)}p"
-                    f"  {who} (p{partner})",
+                    seat_line(
+                        state, seat,
+                        label=(seat_labels or {}).get(seat, ""),
+                        acting=seat == acting_seat,
+                        human=seat == human_seat,
+                    ),
                     ACTING if seat == acting_seat else MUTED,
                 )
             )
+        if human_seat is not None:
+            lines.append((f"  your pips  {state.pips(human_seat)}", MUTED))
         lines.append(("", TEXT))
         for text in last_actions[-6:]:
             lines.append((text, MUTED))
@@ -332,6 +335,18 @@ class Renderer:
             if rect.collidepoint(pos):
                 return end
         return None
+
+
+def seat_line(state: GameState, seat: int, *, label: str = "", acting: bool = False,
+              human: bool = False) -> str:
+    """Panel line for one seat: how many tiles it holds and who plays it.
+
+    Only the *number* of remaining tiles is shown -- every player can see the
+    backs on a real table -- never which tiles they are.
+    """
+    marker = "->" if acting else "  "
+    who = "you" if human else label
+    return f"{marker} seat {seat}  {state.hand_size(seat)} tiles left  {who}"
 
 
 def format_action(tile: int, end: int | None = None) -> str:

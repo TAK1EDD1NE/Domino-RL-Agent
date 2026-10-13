@@ -51,6 +51,9 @@ class PlayConfig:
     seed: int = 0
     match_to: int = 100
     fps: int = 30
+    #: Seconds the AI waits between its own moves, so a human can follow the
+    #: deal instead of watching it finish in one frame. 0 = as fast as possible.
+    ai_delay: float = 0.7
     autoplay: bool = False
     quiet: bool = False
     #: Per-seat overrides, ``{seat: "KIND[:checkpoint]"}``, so the three AI seats
@@ -176,6 +179,45 @@ def _placements(state: GameState, seat: int, tile: int) -> list[int]:
     return [end for (candidate, end) in state.legal_moves(seat) if candidate == tile]
 
 
+def _human_click(
+    state: GameState,
+    cfg: PlayConfig,
+    renderer: Renderer,
+    pos: tuple[int, int],
+    pending_tile: int | None,
+) -> tuple[int | None, str]:
+    """Handle one click for the human, returning the new pending tile and banner.
+
+    The two framed ends of the line are tested **before** the hand, because a
+    pending tile that fits both open ends is completed by clicking the end it
+    should attach to. The frames sit on the board and the hand row at the bottom
+    of the window, so the two targets never overlap.
+    """
+    if pending_tile is not None:
+        end = renderer.end_at(pos, state, state.ends)
+        if end is not None:
+            placements = _placements(state, cfg.human_seat, pending_tile)
+            if end in placements:
+                state.play(cfg.human_seat, pending_tile, end)
+                cfg.last_actions.append(f"you: {format_action(pending_tile, end)}")
+                return None, "played"
+            return pending_tile, f"end {end} does not take {format_action(pending_tile)}"
+
+    tile = renderer.tile_at(pos)
+    if tile is None:                       # a click on the table itself: keep the choice
+        return pending_tile, ""
+    placements = _placements(state, cfg.human_seat, tile)
+    if not placements:
+        return None, f"{format_action(tile)} cannot be played on either end"
+    if len(placements) == 1:
+        state.play(cfg.human_seat, tile, placements[0])
+        cfg.last_actions.append(f"you: {format_action(tile, placements[0])}")
+        return None, "played"
+    if pending_tile == tile:               # clicking the selected tile again clears it
+        return None, "selection cleared"
+    return tile, f"{format_action(tile)} fits both ends — click the framed end to use it"
+
+
 def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) -> int:
     """Run the interactive mode until the window is closed.
 
@@ -193,6 +235,9 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
     pending_tile: int | None = None
     frames = 0
     running = True
+    #: The AI plays at most one move per ``ai_delay`` seconds. The window keeps
+    #: drawing and polling while it waits, so the delay never blocks the UI.
+    next_ai_move = time.monotonic()
 
     while running:
         legal = state.legal_actions(cfg.human_seat) if state.turn == cfg.human_seat else []
@@ -223,40 +268,27 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
                 pending_tile = None
                 banner = "new deal"
             elif event.type == pygame.MOUSEBUTTONDOWN and state.turn == cfg.human_seat:
-                tile = renderer.tile_at(event.pos)
-                if tile is None:
-                    continue
-                placements = _placements(state, cfg.human_seat, tile)
-                if not placements:
-                    banner = f"{format_action(tile)} cannot be played on either end"
-                    pending_tile = None
-                elif len(placements) == 1:
-                    state.play(cfg.human_seat, tile, placements[0])
-                    cfg.last_actions.append(f"you: {format_action(tile, placements[0])}")
-                    pending_tile = None
-                    banner = "played"
-                elif pending_tile == tile:
-                    end = renderer.end_at(event.pos, state, state.ends)
-                    if end in placements:
-                        state.play(cfg.human_seat, tile, end)
-                        cfg.last_actions.append(f"you: {format_action(tile, end)}")
-                        pending_tile = None
-                        banner = "played"
-                else:
-                    pending_tile = tile
-                    banner = f"{format_action(tile)} fits both ends — click the end to use"
+                before = len(state.table)
+                pending_tile, message = _human_click(state, cfg, renderer, event.pos, pending_tile)
+                if message:
+                    banner = message
+                if len(state.table) != before:      # you moved: give the AI a beat too
+                    next_ai_move = time.monotonic() + cfg.ai_delay
 
         if running and (state.turn != cfg.human_seat or cfg.autoplay):
-            seat = state.turn
-            if state.must_pass(seat):
-                state.pass_turn(seat)
-                cfg.last_actions.append(f"seat {seat}: pass (stuck)")
-            else:
-                agent = agents[seat]
-                action = int(agent.act(state, seat))
-                tile, end = decode_action(action)
-                state.play(seat, tile, end)
-                cfg.last_actions.append(f"seat {seat} ({agent.name}): {format_action(tile, end)}")
+            if time.monotonic() >= next_ai_move:
+                seat = state.turn
+                if state.must_pass(seat):
+                    state.pass_turn(seat)
+                    cfg.last_actions.append(f"seat {seat}: pass (stuck)")
+                else:
+                    agent = agents[seat]
+                    action = int(agent.act(state, seat))
+                    tile, end = decode_action(action)
+                    state.play(seat, tile, end)
+                    cfg.last_actions.append(f"seat {seat} ({agent.name}): {format_action(tile, end)}")
+                    banner = f"seat {seat} ({agent.name}) to move" if not cfg.autoplay else banner
+                next_ai_move = time.monotonic() + cfg.ai_delay
 
         if state.is_terminal():
             outcome = deal_outcome(state)

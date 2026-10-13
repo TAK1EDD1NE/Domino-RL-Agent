@@ -82,6 +82,19 @@ def test_action_text_helpers():
     assert describe_hand([tile_id(6, 6)]) == "[6|6] (12 pips)"
 
 
+def test_the_panel_shows_how_many_tiles_each_seat_has_left():
+    """Only the count per seat -- never which tiles a seat is holding."""
+    from domino.ui.render import seat_line
+
+    state = _mid_deal_state()          # whoever led has already shed one tile
+    for seat in range(4):
+        line = seat_line(state, seat, label="rule")
+        assert f"{state.hand_size(seat)} tiles left" in line
+        assert "[" not in line, "the panel must not name a seat's tiles"
+    assert seat_line(state, 0, label="rl-4.0M", acting=True) == "-> seat 0  6 tiles left  rl-4.0M"
+    assert seat_line(state, 1, human=True) == "   seat 1  7 tiles left  you"  # aligns with '->'
+
+
 def test_ambiguous_tile_draws_the_end_frames_it_makes_clickable():
     """A tile fitting both ends must show the two targets the click tests."""
     from domino.ui.render import ACTING
