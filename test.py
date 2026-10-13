@@ -76,6 +76,7 @@ MATCHUPS: tuple[str, ...] = (
     "rule_vs_random",
     "rl_vs_rl",
     "rule_vs_rule",
+    "random_vs_random",
 )
 
 TEAM_A_SEATS: tuple[int, int] = (0, 2)

@@ -1,0 +1,2 @@
+matchup,agent_a,agent_b,deals,wins_a,wins_b,win_rate_a,ci_low,ci_high,points_per_deal_a,points_per_deal_b,match_win_rate_a,matches_played,block_rate,void_rate,mean_pips_left_a,ms_per_action,model_path,seed
+rule_vs_rule,rule,rule,400,197,203,0.4925,0.4438103957369542,0.5413322938720411,9.2325,9.7725,0.0,1,0.5075,0.0430622009569378,15.8575,0.23146774912157303,models/checkpoints/latest.zip,2
