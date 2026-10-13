@@ -15,6 +15,7 @@ import subprocess  # noqa: E402
 import sys  # noqa: E402
 
 import numpy as np  # noqa: E402
+import pygame  # noqa: E402
 import pytest  # noqa: E402
 
 from domino.agents import RandomAgent, RuleAgent  # noqa: E402
@@ -142,9 +143,11 @@ def test_board_draws_the_line_on_both_sides_of_the_opener():
 def test_the_renderer_draws_a_reversed_tile_reversed():
     """The line's orientation must reach the screen, not just the layout."""
     from domino.ui.board import layout_line
+    from domino.ui.render import table_geometry
 
     state = _scripted_state(seed=0)
-    layout = layout_line(state, (1280, 720))
+    x, y, width, _height = table_geometry((1280, 720))["line"]
+    layout = layout_line(state, (1280, 720), top=y, left=x, right=x + width)
     # skip the two extreme tiles: the open-end frames are painted over them
     reversed_tiles = [
         placed for index, placed in enumerate(layout.tiles)
@@ -189,11 +192,15 @@ def _pixels(surface) -> list[tuple[int, int, int]]:
 
 
 def _opener_rect(state, renderer):
+    """The opener's rect in the layout the renderer actually draws."""
     from domino.ui.board import line_tiles, layout_line
+    from domino.ui.render import table_geometry
 
-    ordered, anchor = line_tiles(state)
-    layout = layout_line(state, renderer.size)
-    return next(p.rect for p in layout.tiles if p.tile == ordered[anchor][0])
+    x, y, width, _height = table_geometry(renderer.size)["line"]
+    return next(
+        p.rect for p in layout_line(state, renderer.size, top=y, left=x, right=x + width).tiles
+        if p.tile == line_tiles(state)[0][line_tiles(state)[1]][0]
+    )
 
 
 def _scripted_state(seed: int = 0):
@@ -351,3 +358,108 @@ def test_training_path_never_imports_pygame():
             if line.strip().startswith(("import pygame", "from pygame"))
         ]
         assert not imports, f"{relative} must not import pygame (found {imports})"
+
+
+# --------------------------------------------------------------------------- #
+# The table view: your hand face up, every other seat face down
+# --------------------------------------------------------------------------- #
+def _region_colours(renderer, rect) -> set[tuple[int, int, int]]:
+    return {
+        renderer.screen.get_at((x, y))[:3]
+        for x in range(rect.x + 2, rect.right - 2, 3)
+        for y in range(rect.y + 2, rect.bottom - 2, 3)
+    }
+
+
+def _table_draw(state, renderer, **kwargs) -> None:
+    renderer.draw(state, acting_seat=1, human_seat=1, legal=state.legal_actions(1),
+                  seat_labels={0: "rl-4.0M", 2: "rule", 3: "rl-latest"}, **kwargs)
+
+
+def test_the_table_regions_fit_the_window_without_overlapping():
+    from domino.ui.render import table_geometry
+
+    for size in ((1280, 720), (1024, 640)):
+        regions = table_geometry(size)
+        width, height = size
+        for name, (x, y, w, h) in regions.items():
+            assert x >= 0 and y >= 0 and x + w <= width and y + h <= height, name
+        bar, partner = regions["bar"], regions["partner"]
+        line, hand = regions["line"], regions["hand"]
+        left, right = regions["left"], regions["right"]
+        assert partner[1] >= bar[1] + bar[3], "the partner sits under the status bar"
+        assert line[1] >= partner[1] + partner[3], "the line band starts below the partner"
+        assert hand[1] >= line[1] + line[3], "your hand is at the bottom"
+        assert left[0] + left[2] <= line[0], "the left stack is outside the line band"
+        assert right[0] >= line[0] + line[2], "the right stack is outside the line band"
+        assert line[2] > width // 2, "the line band must be worth drawing in"
+
+
+def test_the_table_shows_your_hand_face_up_and_the_others_face_down():
+    from domino.ui.render import BACK, TILE, TILE_DIM, seat_sides
+
+    state = _scripted_state(seed=0)
+    renderer = Renderer(size=(1280, 720))
+    try:
+        _table_draw(state, renderer)
+        sides = seat_sides(1)
+        assert sides["partner"] == 3, "your partner sits opposite you"
+        assert {sides["left"], sides["right"]} == {0, 2}, "the opponents sit left and right"
+
+        assert len(renderer.hand_rects) == state.hand_size(1)
+        playable = set(state.legal_actions(1))
+        for tile, rect in renderer.hand_rects.items():
+            colours = _region_colours(renderer, rect)
+            assert BACK not in colours, "your tiles are face up"
+            assert colours & {TILE, TILE_DIM}, "a face-up tile body must be drawn"
+            if tile in playable:
+                assert TILE in colours, "a playable tile is drawn bright"
+            else:
+                assert TILE_DIM in colours, "an unplayable tile is drawn dimmed"
+
+        for side in ("partner", "left", "right"):
+            seat = sides[side]
+            rects = renderer.seat_rects[seat]
+            assert len(rects) == state.hand_size(seat), "one face-down tile per tile held"
+            for rect in rects:
+                colours = _region_colours(renderer, rect)
+                assert BACK in colours and TILE not in colours, "their tiles are face down"
+        assert 1 not in renderer.seat_rects, "your seat is the hand, not a stack of backs"
+    finally:
+        renderer.close()
+
+
+def test_the_face_down_count_follows_the_engine_hand_sizes():
+    from domino.engine import GameState
+    from domino.ui.render import seat_sides
+
+    hands = [[tile_id(0, 4)], [tile_id(0, 1)], [tile_id(4, 1)], [tile_id(1, 1)]]
+    state = GameState(hands=hands, rng=np.random.default_rng(0), turn=0, leader=0)
+    state.play(0, tile_id(0, 4))              # seat 0 goes out: no tiles to show
+    renderer = Renderer(size=(1280, 720))
+    try:
+        _table_draw(state, renderer)
+        sides = seat_sides(1)
+        assert len(renderer.seat_rects[sides["partner"]]) == 1        # seat 3 holds one
+        assert renderer.seat_rects[0] == [], "a seat that went out shows no tiles"
+        assert len(renderer.hand_rects) == 1                          # your own single tile
+    finally:
+        renderer.close()
+
+
+def test_the_summary_is_drawn_over_the_table_and_does_not_crash():
+    from domino.ui.render import ACTING, PANEL
+
+    state = _mid_deal_state()
+    renderer = Renderer(size=(1280, 720))
+    try:
+        _table_draw(state, renderer)
+        renderer.draw_summary(["your team takes 12 points", "match    12 : 4"],
+                              title="hand 3 — your team takes 12 points",
+                              hint="press SPACE (or click) to deal the next hand")
+        box = pygame.Rect(0, 0, int(1280 * 0.68), int(720 * 0.54))
+        box.center = (640, 360)
+        assert renderer.screen.get_at(box.center)[:3] in (PANEL, ACTING)
+        assert renderer.screen.get_at((6, 6))[:3] != (24, 84, 52), "the table is dimmed behind it"
+    finally:
+        renderer.close()

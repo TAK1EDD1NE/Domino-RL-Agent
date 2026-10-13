@@ -8,8 +8,10 @@ value stays open.
 Each of the three AI seats can be given its own agent with a repeatable
 ``--agent SEAT=KIND[:CHECKPOINT]``, so you can face, for example, the 15M network
 on one side and the rule bot on the other while the 4M network partners you.
-``--ai-delay`` slows the AI down so you can follow the deal (its panel shows how
-many tiles each player has left, never which ones).
+``--ai-delay`` slows the AI down so you can follow the deal. The window is a
+table: your tiles are face up at the bottom, the three other seats show face-down
+tiles around it, and a finished hand is reported (who took the points, why, what
+each side was left holding) until you press SPACE for the next hand.
 
 Examples
 --------

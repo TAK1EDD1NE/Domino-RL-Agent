@@ -128,24 +128,27 @@ def layout_line(
     size: tuple[int, int],
     *,
     top: int = BOARD_TOP,
-    margin: int = BOARD_MARGIN,
+    left: int = BOARD_MARGIN,
+    right: int | None = None,
     gap: int = TILE_GAP,
 ) -> LineLayout:
     """Lay the line out on screen, growing away from the opener on both sides.
 
-    The opener stays where it was first drawn (the line does not jump around as
-    tiles are added) and each side extends outwards from it; a side that reaches
-    the board edge overflows onto the next row, laid out in reading order. Tiles
-    that a side pushes past its edge keep their relative order, so the only place
-    the "matching numbers touch" invariant breaks is the row break itself -- the
-    same break a real table has when a line is restarted on a new row.
+    ``top``/``left``/``right`` bound the board area (``right`` defaults to leaving
+    room for the legacy side panel). The opener stays where it was first drawn --
+    the line does not jump around as tiles are added -- and each side extends
+    outwards from it; a side that reaches the board edge overflows onto the next
+    row, laid out in reading order. Tiles that a side pushes past its edge keep
+    their relative order, so the only place the "matching numbers touch" invariant
+    breaks is the row break itself -- the same break a real table has when a line
+    is restarted on a new row.
     """
     tiles, anchor = line_tiles(state)
     if not tiles:
         return LineLayout((), {})
 
-    board_w = size[0] - PANEL_W
-    avail = board_w - 2 * margin
+    right = (size[0] - PANEL_W) if right is None else right
+    avail = max(TILE_LONG, right - left)
     widths = [tile_width(t) for t, _ in tiles]
     heights = [tile_height(t) for t, _ in tiles]
     total = len(tiles)
@@ -159,13 +162,13 @@ def layout_line(
         )
 
     # Row 0: the opener is centred, so the line has room to grow both ways.
-    anchor_x = margin + max(0, (avail - widths[anchor]) // 2)
+    anchor_x = left + max(0, (avail - widths[anchor]) // 2)
     put(anchor, anchor_x, 0)
 
     cursor = anchor_x + widths[anchor] + gap
     fitted_right = 0
     for index in range(anchor + 1, total):
-        if cursor + widths[index] > margin + avail:
+        if cursor + widths[index] > right:
             break
         put(index, cursor, 0)
         cursor += widths[index] + gap
@@ -175,7 +178,7 @@ def layout_line(
     fitted_left = 0
     for index in range(anchor - 1, -1, -1):
         x = cursor - widths[index]
-        if x < margin:
+        if x < left:
             break
         put(index, x, 0)
         cursor = x - gap
@@ -188,11 +191,11 @@ def layout_line(
     for group in (overflow_right, overflow_left):
         if not group:
             continue
-        cursor = margin
+        cursor = left
         for index in group:
-            if cursor + widths[index] > margin + avail:
+            if cursor + widths[index] > right:
                 row += 1
-                cursor = margin
+                cursor = left
             put(index, cursor, row)
             cursor += widths[index] + gap
         row += 1

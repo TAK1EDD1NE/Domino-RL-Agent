@@ -30,7 +30,6 @@ from ..engine import (
     deal_outcome,
     new_deal,
     next_leader,
-    redeal_after_void,
 )
 from ..masks import decode_action
 from .render import Renderer, format_action
@@ -60,6 +59,9 @@ class PlayConfig:
     #: can be three *different* agents (e.g. two checkpoints and the rule bot).
     seat_agents: dict[int, str] = field(default_factory=dict)
     last_actions: list[str] = field(default_factory=list)
+    #: Title and lines of the most recent end-of-hand report (for tests and for a
+    #: caller that wants to know what the table said).
+    last_summary: list[str] = field(default_factory=list)
 
 
 def parse_seat_agent(spec: str) -> tuple[str, str | None]:
@@ -174,6 +176,63 @@ def seat_labels(agents: dict[int, Agent], human_seat: int | None = None) -> dict
     return labels
 
 
+def _pips_lines(state: GameState, labels: dict[int, str], human_seat: int) -> list[str]:
+    """What each team was still holding when the hand ended, your team first."""
+    yours = [seat for seat in range(4) if TEAM_OF_SEAT[seat] == TEAM_OF_SEAT[human_seat]]
+    theirs = [seat for seat in range(4) if TEAM_OF_SEAT[seat] != TEAM_OF_SEAT[human_seat]]
+
+    def fmt(seats: list[int]) -> str:
+        return "   ".join(f"seat {s} ({labels.get(s, '?')}) {state.pips(s)}p" for s in seats)
+
+    return [f"your team left      {fmt(yours)}", f"the AI team left    {fmt(theirs)}"]
+
+
+def deal_summary(
+    state: GameState,
+    outcome,
+    *,
+    human_seat: int,
+    labels: dict[int, str],
+    scores: list[int],
+    match_to: int,
+) -> tuple[str, list[str], bool]:
+    """Title, report lines and whether the match ended, for a finished hand.
+
+    Written for the player, not for the log: who took the points, why, and what
+    every seat was left holding.
+    """
+    your_team = TEAM_OF_SEAT[human_seat]
+    if outcome.void:
+        return (
+            f"hand {state.deal_no} — void, no points",
+            [
+                "the fewest-pip players are on different teams, so nobody scores",
+                "the hand is redealt and the [6|6] holder leads",
+                "",
+                *_pips_lines(state, labels, human_seat),
+            ],
+            False,
+        )
+    winner = "your team" if outcome.winner_team == your_team else "the AI team"
+    seat = outcome.winning_seat
+    who = labels.get(seat, f"seat {seat}")
+    if outcome.reason == "emptied":
+        why = f"seat {seat} ({who}) went out first — no tiles left"
+    else:
+        why = f"blocked — seat {seat} ({who}) was left holding the fewest pips"
+    match_over = max(scores) >= match_to
+    lines = [why, "", *_pips_lines(state, labels, human_seat), "",
+             f"match    your team {scores[your_team]} : {scores[1 - your_team]} the AI team"]
+    if match_over:
+        won = scores[your_team] >= scores[1 - your_team]
+        lines.append("")
+        lines.append(
+            f"MATCH OVER — {'your team' if won else 'the AI team'} wins "
+            f"{max(scores)} : {min(scores)}"
+        )
+    return f"hand {state.deal_no} — {winner} takes {outcome.points} points", lines, match_over
+
+
 def _placements(state: GameState, seat: int, tile: int) -> list[int]:
     """End indices on which ``tile`` may be played by ``seat``."""
     return [end for (candidate, end) in state.legal_moves(seat) if candidate == tile]
@@ -238,21 +297,48 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
     #: The AI plays at most one move per ``ai_delay`` seconds. The window keeps
     #: drawing and polling while it waits, so the delay never blocks the UI.
     next_ai_move = time.monotonic()
+    #: Set when a hand finishes: ``(title, lines)`` shown over the final position
+    #: until the player asks for the next hand (nothing is dealt behind it).
+    summary: tuple[str, list[str]] | None = None
+    #: How to start the hand after the report is dismissed.
+    next_plan: tuple[int | None, int] = (None, 2)
+    match_over = False
+
+    def start_next_hand() -> GameState:
+        """Deal the hand the report promised (or a fresh match if it just ended)."""
+        nonlocal scores, match_over
+        leader, deal_no = next_plan
+        if match_over:
+            scores = [0, 0]
+            leader, deal_no = None, 1
+        return new_deal(
+            deal_no=deal_no, rng=rng,
+            lead_mode="six_six" if leader is None else "winner",
+            leader=leader, scores=scores,
+        )
 
     while running:
-        legal = state.legal_actions(cfg.human_seat) if state.turn == cfg.human_seat else []
-        ambiguous = [end for end in _placements(state, cfg.human_seat, pending_tile or -1)]
+        playing = summary is None and not state.is_terminal()
+        legal = state.legal_actions(cfg.human_seat) if playing and state.turn == cfg.human_seat else []
+        ambiguous = ([end for end in _placements(state, cfg.human_seat, pending_tile or -1)]
+                     if pending_tile is not None else [])
         renderer.draw(
             state,
-            acting_seat=state.turn,
-            human_seat=cfg.human_seat,
+            acting_seat=state.turn if playing else None,
+            human_seat=cfg.human_seat if summary is None else None,
             legal=legal,
             banner=banner,
             last_actions=cfg.last_actions,
             selected=pending_tile,
-            ambiguous_ends=ambiguous if pending_tile is not None else [],
+            ambiguous_ends=ambiguous,
             seat_labels=labels,
         )
+        if summary is not None:
+            renderer.draw_summary(
+                summary[1], title=summary[0],
+                hint=("press SPACE for a new match (or click)"
+                      if match_over else "press SPACE (or click) to deal the next hand"),
+            )
 
         for event in renderer.poll():
             if event.type == pygame.QUIT or (
@@ -264,9 +350,19 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
                 banner = f"autoplay {'on' if cfg.autoplay else 'off'}"
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
                 scores = [0, 0]
+                match_over, summary = False, None
                 state = new_deal(deal_no=1, rng=rng, lead_mode="six_six", scores=scores)
                 pending_tile = None
-                banner = "new deal"
+                banner = "your turn" if state.turn == cfg.human_seat else "AI thinking"
+            elif summary is not None:
+                if event.type == pygame.MOUSEBUTTONDOWN or (
+                    event.type == pygame.KEYDOWN
+                    and event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER)
+                ):
+                    state = start_next_hand()
+                    summary = None
+                    pending_tile = None
+                    banner = "your turn" if state.turn == cfg.human_seat else "AI thinking"
             elif event.type == pygame.MOUSEBUTTONDOWN and state.turn == cfg.human_seat:
                 before = len(state.table)
                 pending_tile, message = _human_click(state, cfg, renderer, event.pos, pending_tile)
@@ -275,7 +371,7 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
                 if len(state.table) != before:      # you moved: give the AI a beat too
                     next_ai_move = time.monotonic() + cfg.ai_delay
 
-        if running and (state.turn != cfg.human_seat or cfg.autoplay):
+        if playing and (state.turn != cfg.human_seat or cfg.autoplay):
             if time.monotonic() >= next_ai_move:
                 seat = state.turn
                 if state.must_pass(seat):
@@ -292,10 +388,10 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
 
         # Your seat is subject to the same mandatory-play rule as the AI: when you
         # have no playable tile the pass is forced, so the loop must take it for
-        # you instead of waiting for a click that can never come (the deal used to
+        # you instead of waiting for a click that can never come (the hand used to
         # stall here). The short pause is so the reason is readable on screen.
-        elif (running and not cfg.autoplay and state.turn == cfg.human_seat
-                and not state.is_terminal() and state.must_pass(cfg.human_seat)
+        elif (playing and not cfg.autoplay and state.turn == cfg.human_seat
+                and state.must_pass(cfg.human_seat)
                 and time.monotonic() >= next_ai_move):
             state.pass_turn(cfg.human_seat)
             cfg.last_actions.append("you: pass (stuck)")
@@ -303,26 +399,20 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
             banner = "no playable tile — you pass (the rules force it)"
             next_ai_move = time.monotonic() + cfg.ai_delay
 
-        if state.is_terminal():
+        if summary is None and state.is_terminal():
             outcome = deal_outcome(state)
-            if outcome.void:
-                banner = "void deal (fewest-pips tie across teams) — redealt"
-                state = redeal_after_void(state)
-            else:
+            if not outcome.void:
                 scores[outcome.winner_team] += outcome.points
-                winner = "your team" if outcome.winner_team == TEAM_OF_SEAT[cfg.human_seat] else "the AI team"
-                banner = f"{winner} takes {outcome.points} points ({outcome.reason})"
-                if max(scores) >= cfg.match_to:
-                    banner = f"match over — {'your team' if scores.index(max(scores)) == TEAM_OF_SEAT[cfg.human_seat] else 'the AI team'} wins {scores[0]}-{scores[1]} (press n for a new match)"
-                    scores = [0, 0]
-                leader = next_leader(state, outcome)
-                state = new_deal(
-                    deal_no=state.deal_no + 1,
-                    rng=rng,
-                    lead_mode="six_six" if leader is None else "winner",
-                    leader=leader,
-                    scores=scores,
-                )
+                next_plan = (next_leader(state, outcome), state.deal_no + 1)
+            else:
+                next_plan = (None, state.deal_no + 1)
+            title, lines, match_over = deal_summary(
+                state, outcome,
+                human_seat=cfg.human_seat, labels=labels, scores=scores, match_to=cfg.match_to,
+            )
+            summary = (title, lines)
+            cfg.last_summary = [title, *lines]
+            banner = title
             pending_tile = None
 
         renderer.tick(cfg.fps)

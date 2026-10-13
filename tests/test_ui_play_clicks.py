@@ -122,7 +122,8 @@ def test_clicking_the_table_keeps_the_selection_and_the_tile():
     try:
         pending = _pick_tile(renderer, state)
         _draw(renderer, state, pending=pending)
-        pending, banner = _human_click(state, cfg, renderer, (640, 640), pending)
+        # the bottom-right corner of the table: no hand tile, no end frame
+        pending, banner = _human_click(state, cfg, renderer, (1250, 690), pending)
         assert pending == BRIDGE and banner == ""
         assert BRIDGE in state.hands[2] and BRIDGE not in state.table
     finally:
@@ -250,3 +251,106 @@ def test_a_stuck_seat_in_autoplay_is_passed_as_before():
     run_play(cfg, max_frames=400)
     assert not [line for line in cfg.last_actions if "you: pass" in line]
     assert any("pass (stuck)" in line for line in cfg.last_actions), cfg.last_actions
+
+
+# --------------------------------------------------------------------------- #
+# The end-of-hand report
+# --------------------------------------------------------------------------- #
+def _emptied_state():
+    """Seat 2 (the human's seat) goes out on its only tile."""
+    hands = [[tile_id(0, 4), tile_id(5, 5)], [tile_id(0, 1), tile_id(6, 6)],
+             [tile_id(4, 1)], [tile_id(2, 2)]]
+    state = GameState(hands=hands, rng=np.random.default_rng(0), turn=0, leader=0)
+    state.play(0, tile_id(0, 4))              # ends [0, 4]
+    state.play(1, tile_id(0, 1), 0)           # ends [1, 4]
+    state.play(2, tile_id(4, 1), 1)           # seat 2 is out: ends [1, 1]
+    assert state.is_terminal() and state.hands[2] == []
+    return state
+
+
+def test_the_report_says_who_took_the_points_and_why():
+    from domino.engine import deal_outcome
+    from domino.ui.play_loop import deal_summary
+
+    state = _emptied_state()
+    outcome = deal_outcome(state)
+    scores = [0, 0]
+    scores[outcome.winner_team] += outcome.points
+    title, lines, match_over = deal_summary(
+        state, outcome, human_seat=2, labels={0: "rl-4.0M", 1: "b", 2: "you", 3: "d"},
+        scores=scores, match_to=100,
+    )
+    assert outcome.points == 16, "the two opponents' pips"
+    assert title == "hand 1 — your team takes 16 points"
+    assert any("went out first" in line for line in lines)
+    assert any(line.startswith("your team left") for line in lines)
+    assert any(line.startswith("the AI team left") for line in lines)
+    assert any("match    your team 16 : 0 the AI team" in line for line in lines)
+    assert not match_over and not any("MATCH OVER" in line for line in lines)
+
+
+def test_the_report_names_a_blocked_hand_and_the_team_that_lost():
+    from domino.engine import DealOutcome
+    from domino.ui.play_loop import deal_summary
+
+    state = _emptied_state()
+    blocked = DealOutcome(winner_team=0, points=9, blocked=True, void=False,
+                          reason="blocked", winning_seat=2)
+    title, lines, match_over = deal_summary(
+        state, blocked, human_seat=1, labels={0: "a", 1: "you", 2: "c", 3: "d"},
+        scores=[9, 0], match_to=100,
+    )
+    assert title == "hand 1 — the AI team takes 9 points"
+    assert any("blocked" in line and "fewest pips" in line for line in lines)
+    assert not match_over
+
+
+def test_the_report_announces_the_end_of_the_match():
+    from domino.engine import DealOutcome
+    from domino.ui.play_loop import deal_summary
+
+    state = _emptied_state()
+    outcome = DealOutcome(winner_team=0, points=10, blocked=False, void=False,
+                          reason="emptied", winning_seat=2)
+    title, lines, match_over = deal_summary(
+        state, outcome, human_seat=2, labels={0: "a", 1: "b", 2: "you", 3: "d"},
+        scores=[100, 84], match_to=100,
+    )
+    assert match_over
+    assert any("MATCH OVER" in line and "your team wins 100 : 84" in line for line in lines)
+
+
+def test_the_report_explains_a_void_hand():
+    from domino.engine import DealOutcome
+    from domino.ui.play_loop import deal_summary
+
+    state = _emptied_state()
+    void = DealOutcome(None, 0, True, True, "void_tie", None)
+    title, lines, match_over = deal_summary(
+        state, void, human_seat=1, labels={0: "a", 1: "you", 2: "c", 3: "d"},
+        scores=[20, 20], match_to=100,
+    )
+    assert title == "hand 1 — void, no points"
+    assert any("different teams" in line for line in lines)
+    assert not match_over
+
+
+def test_a_finished_hand_is_reported_and_the_next_one_waits_for_you():
+    """Reported: "at the end of the hand it shows me what happened and who won"."""
+    def play(frames: int):
+        cfg = PlayConfig(human_seat=1, partner="rule", opponents="rule", autoplay=True,
+                         fps=0, ai_delay=0.0, seed=0)
+        run_play(cfg, max_frames=frames)
+        return cfg
+
+    short = play(1500)
+    assert short.last_summary, "the finished hand must be reported"
+    assert "hand 1" in short.last_summary[0]
+    assert any("takes" in line for line in short.last_summary)
+    played = len(short.last_actions)
+    assert played > 5, short.last_actions
+
+    # three times the frames and not one extra move: nothing is dealt behind it
+    longer = play(4500)
+    assert len(longer.last_actions) == played, "the next hand must wait for the player"
+    assert longer.last_summary == short.last_summary
