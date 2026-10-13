@@ -371,6 +371,34 @@ def _region_colours(renderer, rect) -> set[tuple[int, int, int]]:
     }
 
 
+def _has_tile_body(renderer, rect) -> bool:
+    """True when the region holds light tile-body pixels (a face-up tile).
+
+    Scaled tiles are antialiased, so the body is near-white rather than exactly
+    ``TILE`` -- compare brightness, not equality.
+    """
+    return any(
+        min(renderer.screen.get_at((x, y))[:3]) > 200
+        for x in range(rect.x + 2, rect.right - 2)
+        for y in range(rect.y + 2, rect.bottom - 2)
+    )
+
+
+def _has_back_colour(renderer, rect) -> bool:
+    """True when the region holds face-down tile pixels.
+
+    A back is drawn unscaled, so its body colour is exactly ``BACK``; the
+    antialiased face-up tiles never produce it.
+    """
+    from domino.ui.render import BACK
+
+    return any(
+        renderer.screen.get_at((x, y))[:3] == BACK
+        for x in range(rect.x, rect.right)
+        for y in range(rect.y, rect.bottom)
+    )
+
+
 def _table_draw(state, renderer, **kwargs) -> None:
     renderer.draw(state, acting_seat=1, human_seat=1, legal=state.legal_actions(1),
                   seat_labels={0: "rl-4.0M", 2: "rule", 3: "rl-latest"}, **kwargs)
@@ -461,5 +489,74 @@ def test_the_summary_is_drawn_over_the_table_and_does_not_crash():
         box.center = (640, 360)
         assert renderer.screen.get_at(box.center)[:3] in (PANEL, ACTING)
         assert renderer.screen.get_at((6, 6))[:3] != (24, 84, 52), "the table is dimmed behind it"
+    finally:
+        renderer.close()
+
+
+# --------------------------------------------------------------------------- #
+# Open hands, and the report's buttons
+# --------------------------------------------------------------------------- #
+def test_revealed_hands_show_the_other_seats_tiles_face_up():
+    from domino.ui.render import seat_sides
+
+    state = _scripted_state(seed=0)
+    renderer = Renderer(size=(1280, 720))
+    try:
+        renderer.draw(state, acting_seat=1, human_seat=1, legal=state.legal_actions(1),
+                      seat_labels={0: "a", 2: "b", 3: "c"}, reveal_hands=True)
+        sides = seat_sides(1)
+        for side in ("partner", "left", "right"):
+            seat = sides[side]
+            rects = renderer.seat_rects[seat]
+            assert len(rects) == state.hand_size(seat), "one tile per tile held"
+            for rect in rects:
+                assert _has_tile_body(renderer, rect), "a revealed tile shows its body"
+                assert not _has_back_colour(renderer, rect), "a revealed tile is not face down"
+        off = renderer.draw(state, acting_seat=1, human_seat=1, legal=[],
+                            seat_labels={0: "a", 2: "b", 3: "c"}, reveal_hands=False)
+        assert off is None
+        for side in ("partner", "left", "right"):
+            rect = renderer.seat_rects[sides[side]][0]
+            assert _has_back_colour(renderer, rect), "H turns them face down again"
+            assert not _has_tile_body(renderer, rect)
+    finally:
+        renderer.close()
+
+
+def test_tile_surfaces_are_scaled_rotated_and_cached():
+    from domino.ui.render import SEAT_TILE_SCALE, tile_surface
+    from domino.ui.board import TILE_LONG, TILE_SHORT
+
+    normal = tile_surface(tile_id(2, 5))
+    assert (normal.get_width(), normal.get_height()) == (
+        int(TILE_LONG * SEAT_TILE_SCALE), int(TILE_SHORT * SEAT_TILE_SCALE),
+    )
+    double = tile_surface(tile_id(4, 4))
+    assert (double.get_width(), double.get_height()) == (
+        int(TILE_SHORT * SEAT_TILE_SCALE), int(TILE_LONG * SEAT_TILE_SCALE),
+    )
+    assert tile_surface(tile_id(2, 5)) is normal, "surfaces are cached per tile"
+
+
+def test_the_report_buttons_are_returned_and_clickable():
+    from domino.ui.render import BUTTON
+
+    state = _mid_deal_state()
+    renderer = Renderer(size=(1280, 720))
+    try:
+        rects = renderer.draw_summary(
+            ["your team takes 12 points"], title="hand 3",
+            hint="hint", buttons=(("replay", "R — replay this hand"), ("next", "SPACE — next hand")),
+        )
+        assert set(rects) == {"replay", "next"}
+        replay_rect, next_rect = rects["replay"], rects["next"]
+        assert replay_rect.right <= next_rect.left, "buttons do not overlap"
+        for rect in (replay_rect, next_rect):
+            assert BUTTON in _region_colours(renderer, rect)
+            assert renderer.button_at(rect.center) in ("replay", "next")
+        assert renderer.button_at((5, 5)) is None
+        # each button answers for itself, not for its neighbour
+        assert renderer.button_at(replay_rect.center) == "replay"
+        assert renderer.button_at(next_rect.center) == "next"
     finally:
         renderer.close()

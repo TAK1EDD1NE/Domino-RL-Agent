@@ -1,14 +1,18 @@
 """Pygame rendering for the 2v2 domino table (interactive mode and replays).
 
 The window *is* the table: you sit at the bottom with your tiles face up, your
-partner sits opposite and the two opponents sit left and right, each shown as as
-many face-down tiles as they still hold -- a count (everyone can see the backs on
-a real table), never which tiles they are, which is hidden information. The line
-is laid out by :mod:`domino.ui.board`, which rebuilds the physical line from the
-engine's ``(table, table_ends)`` so the numbers that touch each other always
-match, and frames the two open ends where they really are. A finished hand is
-reported by :meth:`Renderer.draw_summary` rather than silently replaced by the
-next one.
+partner sits opposite and the two opponents sit left and right. The other seats
+show one tile per tile they hold -- face down by default (a real opponent's hand
+is hidden information), or face up when the caller asks for the open-hands view
+the owner uses to watch a game. The line is laid out by :mod:`domino.ui.board`,
+which rebuilds the physical line from the engine's ``(table, table_ends)`` so the
+numbers that touch each other always match, and frames the two open ends where
+they really are.
+
+A finished hand is reported by :meth:`Renderer.draw_summary` -- with clickable
+buttons -- rather than silently replaced by the next one, and any position that
+has already been played can be drawn again, which is what the replay mode walks
+through.
 """
 from __future__ import annotations
 
@@ -37,7 +41,9 @@ ACTING = (255, 214, 96)
 LEGAL = (110, 220, 140)
 TEXT = (238, 238, 238)
 MUTED = (168, 178, 172)
-#: A face-down tile (the other seats' hands).
+BUTTON = (44, 74, 60)
+BUTTON_EDGE = (120, 200, 150)
+#: A face-down tile (the other seats' hands, hidden).
 BACK = (26, 44, 88)
 BACK_EDGE = (12, 22, 44)
 BACK_MARK = (78, 110, 176)
@@ -49,6 +55,10 @@ BACK_LONG: int = 46
 BACK_SHORT: int = 22
 BACK_PITCH: int = 31
 
+#: Scale of the tiles drawn in the other seats' regions (the line and your own
+#: hand are drawn full size).
+SEAT_TILE_SCALE: float = 0.62
+
 #: Normalised pip positions per pip count (x, y in 0..1 inside a half).
 _PIP_LAYOUT: dict[int, tuple[tuple[float, float], ...]] = {
     0: (),
@@ -59,6 +69,9 @@ _PIP_LAYOUT: dict[int, tuple[tuple[float, float], ...]] = {
     5: ((0.28, 0.28), (0.72, 0.28), (0.5, 0.5), (0.28, 0.72), (0.72, 0.72)),
     6: ((0.28, 0.22), (0.72, 0.22), (0.28, 0.5), (0.72, 0.5), (0.28, 0.78), (0.72, 0.78)),
 }
+
+#: Cache of pre-scaled tile surfaces, keyed by ``(tile, scale)``.
+_TILE_SURFACES: dict[tuple[int, float], pygame.Surface] = {}
 
 
 def _draw_pips(surface: pygame.Surface, rect: pygame.Rect, count: int) -> None:
@@ -126,12 +139,41 @@ def draw_back(surface: pygame.Surface, rect: pygame.Rect) -> None:
         pygame.draw.rect(surface, BACK_MARK, inner, width=2, border_radius=3)
 
 
+def tile_surface(tile: int, scale: float = SEAT_TILE_SCALE) -> pygame.Surface:
+    """A tile drawn on its own surface, scaled, for the seats around the table.
+
+    Cached per ``(tile, scale)``: the same handful of surfaces is asked for on
+    every frame, and re-rendering 28 of them per frame is pure waste.
+    """
+    key = (int(tile), round(float(scale), 3))
+    cached = _TILE_SURFACES.get(key)
+    if cached is not None:
+        return cached
+    a, b = tile_values(tile)
+    crosswise = a == b
+    width = TILE_SHORT if crosswise else TILE_LONG
+    height = TILE_LONG if crosswise else TILE_SHORT
+    surface = pygame.Surface((width, height), pygame.SRCALPHA)
+    draw_tile(surface, tile, (0, 0), crosswise=crosswise)
+    if scale != 1.0:
+        surface = pygame.transform.smoothscale(
+            surface, (max(1, int(width * scale)), max(1, int(height * scale)))
+        )
+    _TILE_SURFACES[key] = surface
+    return surface
+
+
+def tile_back_size() -> tuple[int, int]:
+    """Width and height of a face-down tile."""
+    return BACK_LONG, BACK_SHORT
+
+
 def seat_line(state: GameState, seat: int, *, label: str = "", acting: bool = False,
               human: bool = False) -> str:
     """Caption for one seat: how many tiles it holds and who plays it.
 
-    Only the *number* of remaining tiles is shown -- every player can see the
-    backs on a real table -- never which tiles they are.
+    Only the *number* of remaining tiles is shown in the caption; the tiles
+    themselves are drawn either face down (hidden) or face up (open-hands view).
     """
     marker = "->" if acting else "  "
     who = "you" if human else label
@@ -154,14 +196,15 @@ def table_geometry(size: tuple[int, int]) -> dict[str, tuple[int, int, int, int]
     """Regions of the table for a window of ``size``, each ``(x, y, w, h)``.
 
     Scales with the window, so the same layout holds at the 1024x640 the tests
-    use and at the 1280x720 the game opens with: a status bar on top, the partner
-    opposite, the two opponents left and right, the line in the middle and the
-    human's hand across the bottom.
+    use and at the 1280x720 the game opens with: a status strip on top, the
+    partner opposite, the two opponents left and right (wide enough for a
+    revealed tile plus its caption), the line in the middle and your hand across
+    the bottom.
     """
     width, height = size
     bar_h = max(56, int(height * 0.096))
-    strip_h = max(52, int(height * 0.092))
-    side_w = max(64, int(width * 0.052))
+    strip_h = max(78, int(height * 0.11))          # fits a revealed crosswise double
+    side_w = max(76, int(width * 0.059))
     hand_h = TILE_LONG + 26
     line_top = bar_h + strip_h + 8
     line_bottom = height - hand_h - 12
@@ -202,8 +245,10 @@ class Renderer:
         self.hand_rects: dict[int, pygame.Rect] = {}
         #: Click regions of the two open ends, refreshed by every board draw.
         self.end_rects: dict[int, pygame.Rect] = {}
-        #: Face-down tile rects per seat, refreshed by every table draw.
+        #: This seat's tile rects, refreshed by every table draw.
         self.seat_rects: dict[int, list[pygame.Rect]] = {}
+        #: Click regions of the report's buttons, refreshed by ``draw_summary``.
+        self.summary_buttons: dict[str, pygame.Rect] = {}
 
     # -- input ------------------------------------------------------------
     def poll(self) -> list[pygame.event.Event]:
@@ -233,31 +278,43 @@ class Renderer:
         selected: int | None = None,
         ambiguous_ends: Sequence[int] | None = None,
         seat_labels: Mapping[int, str] | None = None,
+        reveal_hands: bool = False,
     ) -> None:
         """Render one frame of ``state`` as a table.
 
-        ``human_seat`` puts your hand face up at the bottom and the other three
-        seats around the table as face-down tiles; ``legal`` marks playable tiles;
-        ``overlay`` draws per-action probability bars (replay mode); ``banner`` is
-        the status message; ``seat_labels`` names the agent in each seat.
+        ``human_seat`` puts your hand face up at the bottom; ``reveal_hands``
+        shows what the other three seats are holding instead of face-down tiles.
+        ``legal`` marks playable tiles, ``overlay`` draws per-action probability
+        bars (replay mode), ``banner`` is the status message and ``seat_labels``
+        names the agent in each seat.
         """
         regions = table_geometry(self.size)
         self.screen.fill(BG)
         self._draw_top_bar(state, regions, acting_seat, banner, seat_labels, human_seat)
-        self._draw_seats(state, regions, acting_seat, human_seat, seat_labels)
+        self._draw_seats(state, regions, acting_seat, human_seat, seat_labels,
+                         reveal=reveal_hands)
         self._draw_board(state, regions, ambiguous_ends or ())
         if human_seat is not None:
             self._draw_hand(state, human_seat, legal or [], selected, ambiguous_ends or [])
         self._draw_footer(regions, last_actions, overlay)
 
-    def draw_summary(self, lines: Sequence[str], *, title: str = "", hint: str = "") -> None:
+    def draw_summary(
+        self,
+        lines: Sequence[str],
+        *,
+        title: str = "",
+        hint: str = "",
+        buttons: Sequence[tuple[str, str]] = (),
+    ) -> dict[str, pygame.Rect]:
         """Draw the end-of-hand report over the finished table.
 
-        The caller decides when to move on, so a hand is never replaced before it
-        has been read; the final position stays visible behind the panel.
+        ``buttons`` are ``(key, label)`` pairs drawn along the bottom of the
+        panel; the returned ``{key: rect}`` map is also kept in
+        :attr:`summary_buttons` so a caller can hit-test clicks. The caller decides
+        when to move on, so a hand is never replaced before it has been read.
         """
         width, height = self.size
-        box = pygame.Rect(0, 0, int(width * 0.68), int(height * 0.54))
+        box = pygame.Rect(0, 0, int(width * 0.68), int(height * 0.56))
         box.center = (width // 2, height // 2)
         scrim = pygame.Surface(self.size, pygame.SRCALPHA)
         scrim.fill((*SCRIM, 205))
@@ -273,9 +330,23 @@ class Renderer:
             if line:
                 self.screen.blit(self.font.render(line, True, TEXT), (box.x + 26, y))
             y += 25
+
+        self.summary_buttons = {}
+        if buttons:
+            button_y = box.bottom - 62
+            x = box.x + 26
+            for key, label in buttons:
+                text = self.font.render(label, True, TEXT)
+                rect = pygame.Rect(x, button_y, text.get_width() + 28, 36)
+                pygame.draw.rect(self.screen, BUTTON, rect, border_radius=8)
+                pygame.draw.rect(self.screen, BUTTON_EDGE, rect, width=2, border_radius=8)
+                self.screen.blit(text, (rect.x + 14, rect.y + 9))
+                self.summary_buttons[key] = rect
+                x = rect.right + 16
         if hint:
             self.screen.blit(self.small.render(hint, True, LEGAL),
-                             (box.x + 26, box.bottom - 30))
+                             (box.x + 26, box.bottom - 24))
+        return dict(self.summary_buttons)
 
     # -- the table's parts ------------------------------------------------
     def _draw_top_bar(
@@ -314,8 +385,15 @@ class Renderer:
         acting_seat: int | None,
         human_seat: int | None,
         seat_labels: Mapping[int, str] | None,
+        *,
+        reveal: bool = False,
     ) -> None:
-        """The seats that are not yours, drawn as face-down tiles around the table."""
+        """The seats that are not yours, around the table.
+
+        One tile per tile held, face down by default or face up when ``reveal``:
+        the partner in a row opposite you, the two opponents in columns left and
+        right, each with its (rotated) caption along the table edge.
+        """
         self.seat_rects = {}
         sides = seat_sides(human_seat)
         for side in ("partner", "left", "right"):
@@ -326,46 +404,74 @@ class Renderer:
                 state, seat, label=(seat_labels or {}).get(seat, ""), acting=seat == acting_seat
             )
             colour = ACTING if seat == acting_seat else MUTED
-            count = state.hand_size(seat)
+            held = sorted(state.hands[seat], reverse=True)
             if side == "partner":
                 x, y, width, _ = regions["partner"]
                 text = caption + ("   (your partner)" if human_seat is not None else "")
                 surface = self.small.render(text, True, colour)
-                self.screen.blit(surface, (x + (width - surface.get_width()) // 2, y + 4))
-                self.seat_rects[seat] = self._draw_back_row(count, width // 2, y + 28)
+                self.screen.blit(surface, (x + (width - surface.get_width()) // 2, y + 2))
+                self.seat_rects[seat] = self._draw_seat_row(held, width // 2, y + 26, reveal)
                 continue
             x, y, width, height = regions[side]
-            stack_x = x if side == "left" else x + width - BACK_SHORT
-            self.seat_rects[seat] = self._draw_back_column(count, stack_x, y + 4, height - 8)
+            stack_x = x if side == "left" else x + width - self._seat_tile_width(reveal)
+            self.seat_rects[seat] = self._draw_seat_column(
+                held, stack_x, y + 4, height - 8, reveal
+            )
             rotated = pygame.transform.rotate(
                 self.small.render(caption, True, colour), 90 if side == "left" else -90
             )
-            label_x = (x + BACK_SHORT + 6 if side == "left"
-                       else x + width - BACK_SHORT - rotated.get_width() - 6)
+            label_x = (x + self._seat_tile_width(reveal) + 8 if side == "left"
+                       else x + width - self._seat_tile_width(reveal)
+                       - rotated.get_width() - 8)
             self.screen.blit(rotated, (label_x, y + (height - rotated.get_height()) // 2))
 
-    def _draw_back_row(self, count: int, centre_x: int, y: int) -> list[pygame.Rect]:
-        """Draw ``count`` face-down tiles in a row centred on ``centre_x``."""
-        pitch = BACK_LONG + 6
-        x = centre_x - (count * pitch - 6 if count else 0) // 2
+    @staticmethod
+    def _seat_tile_width(reveal: bool) -> int:
+        """Width taken up by one seat tile (a revealed tile is wider than a back)."""
+        if not reveal:
+            return BACK_SHORT
+        return int(TILE_LONG * SEAT_TILE_SCALE)
+
+    def _draw_seat_row(
+        self, held: Sequence[int], centre_x: int, y: int, reveal: bool
+    ) -> list[pygame.Rect]:
+        """One seat's tiles in a horizontal row (the partner, opposite you)."""
+        surfaces = [tile_surface(tile) for tile in held] if reveal else []
+        widths = [s.get_width() for s in surfaces] if reveal else [BACK_LONG] * len(held)
+        total = sum(width + 6 for width in widths) - 6 if widths else 0
+        x = centre_x - total // 2
         rects: list[pygame.Rect] = []
-        for _ in range(count):
-            rect = pygame.Rect(x, y, BACK_LONG, BACK_SHORT)
-            draw_back(self.screen, rect)
+        for index, tile in enumerate(held):
+            if reveal:
+                surface = surfaces[index]
+                rect = pygame.Rect(x, y, surface.get_width(), surface.get_height())
+                self.screen.blit(surface, rect.topleft)
+            else:
+                rect = pygame.Rect(x, y, BACK_LONG, BACK_SHORT)
+                draw_back(self.screen, rect)
             rects.append(rect)
-            x += pitch
+            x += widths[index] + 6
         return rects
 
-    def _draw_back_column(self, count: int, x: int, y: int, height: int) -> list[pygame.Rect]:
-        """Draw ``count`` face-down tiles in a vertical column (the side seats)."""
-        total = count * BACK_PITCH - (BACK_PITCH - BACK_LONG) if count else 0
+    def _draw_seat_column(
+        self, held: Sequence[int], x: int, y: int, height: int, reveal: bool
+    ) -> list[pygame.Rect]:
+        """One seat's tiles in a vertical column (the opponents, left and right)."""
+        surfaces = [tile_surface(tile) for tile in held] if reveal else []
+        heights = [s.get_height() for s in surfaces] if reveal else [BACK_LONG] * len(held)
+        total = sum(one + 6 for one in heights) - 6 if heights else 0
         top = y + max(0, (height - total) // 2)
         rects: list[pygame.Rect] = []
-        for _ in range(count):
-            rect = pygame.Rect(x, top, BACK_SHORT, BACK_LONG)
-            draw_back(self.screen, rect)
+        for index, tile in enumerate(held):
+            if reveal:
+                surface = surfaces[index]
+                rect = pygame.Rect(x, top, surface.get_width(), surface.get_height())
+                self.screen.blit(surface, rect.topleft)
+            else:
+                rect = pygame.Rect(x, top, BACK_SHORT, BACK_LONG)
+                draw_back(self.screen, rect)
             rects.append(rect)
-            top += BACK_PITCH
+            top += heights[index] + 6
         return rects
 
     def _draw_open_ends(
@@ -506,4 +612,11 @@ class Renderer:
         for end, rect in sorted(self.end_rects.items()):
             if rect.collidepoint(pos):
                 return end
+        return None
+
+    def button_at(self, pos: tuple[int, int]) -> str | None:
+        """Return the key of the report button under ``pos`` (or ``None``)."""
+        for key, rect in self.summary_buttons.items():
+            if rect.collidepoint(pos):
+                return key
         return None

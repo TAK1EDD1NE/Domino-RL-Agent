@@ -58,10 +58,17 @@ class PlayConfig:
     #: Per-seat overrides, ``{seat: "KIND[:checkpoint]"}``, so the three AI seats
     #: can be three *different* agents (e.g. two checkpoints and the rule bot).
     seat_agents: dict[int, str] = field(default_factory=dict)
+    #: Show what the other seats are holding instead of face-down tiles. The
+    #: open-hands view is for watching a game; ``H`` toggles it while playing.
+    reveal_hands: bool = True
     last_actions: list[str] = field(default_factory=list)
     #: Title and lines of the most recent end-of-hand report (for tests and for a
     #: caller that wants to know what the table said).
     last_summary: list[str] = field(default_factory=list)
+    #: Positions stored for the current hand (1 = the deal alone) and the index the
+    #: replay is showing (``None`` while playing live) -- observables for tests.
+    history_len: int = 1
+    replay_index: int | None = None
 
 
 def parse_seat_agent(spec: str) -> tuple[str, str | None]:
@@ -233,6 +240,14 @@ def deal_summary(
     return f"hand {state.deal_no} — {winner} takes {outcome.points} points", lines, match_over
 
 
+def replay_step(index: int, delta: int, positions: int) -> int:
+    """Move a replay index by ``delta``, kept inside ``0..positions-1``.
+
+    Stepping past either end of a hand is a no-op rather than a wrap or a crash.
+    """
+    return max(0, min(positions - 1, index + delta))
+
+
 def _placements(state: GameState, seat: int, tile: int) -> list[int]:
     """End indices on which ``tile`` may be played by ``seat``."""
     return [end for (candidate, end) in state.legal_moves(seat) if candidate == tile]
@@ -303,6 +318,34 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
     #: How to start the hand after the report is dismissed.
     next_plan: tuple[int | None, int] = (None, 2)
     match_over = False
+    #: Every position of the current hand (``history[0]`` is the deal, ``history[k]``
+    #: the position after move k) with a label per move, so the whole hand can be
+    #: replayed move by move -- what each player played, and what it did to the table.
+    history: list[GameState] = [state.clone()]
+    hand_moves: list[str] = []
+    #: Index into ``history`` while replaying, ``None`` while playing live.
+    replay: int | None = None
+    auto_replay = False
+    next_replay = 0.0
+
+    def record(label: str) -> None:
+        """Remember the position after a move, and the move that got there."""
+        history.append(state.clone())
+        hand_moves.append(label)
+        cfg.history_len = len(history)
+
+    def reset_history() -> None:
+        nonlocal history, hand_moves, replay, auto_replay
+        history, hand_moves = [state.clone()], []
+        replay, auto_replay = None, False
+        cfg.history_len, cfg.replay_index = 1, None
+
+    def enter_replay() -> None:
+        """Walk this hand from its first move, at a readable pace."""
+        nonlocal replay, auto_replay, next_replay
+        replay, auto_replay = 0, True
+        next_replay = time.monotonic() + 0.4
+        cfg.replay_index = replay
 
     def start_next_hand() -> GameState:
         """Deal the hand the report promised (or a fresh match if it just ended)."""
@@ -318,83 +361,147 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
         )
 
     while running:
-        playing = summary is None and not state.is_terminal()
-        legal = state.legal_actions(cfg.human_seat) if playing and state.turn == cfg.human_seat else []
-        ambiguous = ([end for end in _placements(state, cfg.human_seat, pending_tile or -1)]
-                     if pending_tile is not None else [])
+        live = summary is None and replay is None and not state.is_terminal()
+        shown = state if replay is None else history[replay]
+        if replay is not None:
+            what = "hand start (all 7 dealt)" if replay == 0 else hand_moves[replay - 1]
+            banner = f"REPLAY {replay}/{len(history) - 1}    {what}"
+            cfg.replay_index = replay
+        legal = (shown.legal_actions(cfg.human_seat)
+                 if shown.turn == cfg.human_seat and not shown.is_terminal() else [])
+        ambiguous = ([end for end in _placements(shown, cfg.human_seat, pending_tile or -1)]
+                     if live and pending_tile is not None else [])
         renderer.draw(
-            state,
-            acting_seat=state.turn if playing else None,
-            human_seat=cfg.human_seat if summary is None else None,
+            shown,
+            acting_seat=shown.turn if (live or replay is not None) else None,
+            human_seat=cfg.human_seat,
             legal=legal,
             banner=banner,
-            last_actions=cfg.last_actions,
-            selected=pending_tile,
+            last_actions=hand_moves[:replay] if replay is not None else cfg.last_actions,
+            selected=pending_tile if live else None,
             ambiguous_ends=ambiguous,
             seat_labels=labels,
+            reveal_hands=cfg.reveal_hands,
         )
         if summary is not None:
             renderer.draw_summary(
                 summary[1], title=summary[0],
-                hint=("press SPACE for a new match (or click)"
-                      if match_over else "press SPACE (or click) to deal the next hand"),
+                hint=("R / the button replays this hand move by move    ·    "
+                      "SPACE or click for the next hand"),
+                buttons=((("new_match", "N — new match"),) if match_over else ())
+                + (("replay", "R — replay this hand"), ("next", "SPACE — next hand")),
             )
 
         for event in renderer.poll():
             if event.type == pygame.QUIT or (
-                event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q)
+                event.type == pygame.KEYDOWN and event.key == pygame.K_q
             ):
+                running = False
+            elif replay is not None:
+                if event.type == pygame.MOUSEBUTTONDOWN:
+                    replay = replay_step(replay, 1, len(history))
+                    auto_replay = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_RIGHT, pygame.K_SPACE, pygame.K_DOWN):
+                        replay, auto_replay = replay_step(replay, 1, len(history)), False
+                    elif event.key in (pygame.K_LEFT, pygame.K_BACKSPACE, pygame.K_UP):
+                        replay, auto_replay = replay_step(replay, -1, len(history)), False
+                    elif event.key == pygame.K_HOME:
+                        replay, auto_replay = 0, False
+                    elif event.key == pygame.K_END:
+                        replay, auto_replay = len(history) - 1, False
+                    elif event.key == pygame.K_p:
+                        auto_replay = not auto_replay
+                        next_replay = time.monotonic()
+                    elif event.key in (pygame.K_r, pygame.K_ESCAPE):
+                        replay, auto_replay = None, False
+                        cfg.replay_index = None
+                        banner = "back to the table"
+            elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
                 running = False
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_a:
                 cfg.autoplay = not cfg.autoplay
                 banner = f"autoplay {'on' if cfg.autoplay else 'off'}"
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_h:
+                cfg.reveal_hands = not cfg.reveal_hands
+                banner = (f"hands {'shown' if cfg.reveal_hands else 'hidden'} "
+                          f"(press H to switch)")
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                enter_replay()
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
                 scores = [0, 0]
                 match_over, summary = False, None
                 state = new_deal(deal_no=1, rng=rng, lead_mode="six_six", scores=scores)
                 pending_tile = None
+                reset_history()
                 banner = "your turn" if state.turn == cfg.human_seat else "AI thinking"
             elif summary is not None:
-                if event.type == pygame.MOUSEBUTTONDOWN or (
+                clicked = (renderer.button_at(event.pos)
+                           if event.type == pygame.MOUSEBUTTONDOWN else None)
+                if clicked == "replay" or (
+                    event.type == pygame.KEYDOWN and event.key == pygame.K_r
+                ):
+                    enter_replay()
+                elif clicked == "new_match":
+                    scores = [0, 0]
+                    match_over, summary = False, None
+                    state = start_next_hand()
+                    pending_tile = None
+                    reset_history()
+                    banner = "new match — your turn"
+                elif clicked == "next" or (
                     event.type == pygame.KEYDOWN
                     and event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER)
                 ):
                     state = start_next_hand()
                     summary = None
                     pending_tile = None
+                    reset_history()
                     banner = "your turn" if state.turn == cfg.human_seat else "AI thinking"
-            elif event.type == pygame.MOUSEBUTTONDOWN and state.turn == cfg.human_seat:
-                before = len(state.table)
+            elif event.type == pygame.MOUSEBUTTONDOWN and live and state.turn == cfg.human_seat:
+                before = (len(state.table), state.turn, state.pass_streak)
                 pending_tile, message = _human_click(state, cfg, renderer, event.pos, pending_tile)
                 if message:
                     banner = message
-                if len(state.table) != before:      # you moved: give the AI a beat too
+                if (len(state.table), state.turn, state.pass_streak) != before:
+                    record(cfg.last_actions[-1] if cfg.last_actions else "you moved")
                     next_ai_move = time.monotonic() + cfg.ai_delay
 
-        if playing and (state.turn != cfg.human_seat or cfg.autoplay):
+        if replay is not None and auto_replay and time.monotonic() >= next_replay:
+            replay = replay_step(replay, 1, len(history))
+            next_replay = time.monotonic() + max(0.25, cfg.ai_delay * 0.7)
+            if replay >= len(history) - 1:
+                auto_replay = False
+
+        if live and (state.turn != cfg.human_seat or cfg.autoplay):
             if time.monotonic() >= next_ai_move:
                 seat = state.turn
                 if state.must_pass(seat):
                     state.pass_turn(seat)
-                    cfg.last_actions.append(f"seat {seat}: pass (stuck)")
+                    label = f"seat {seat}: pass (stuck)"
+                    cfg.last_actions.append(label)
                 else:
                     agent = agents[seat]
                     action = int(agent.act(state, seat))
                     tile, end = decode_action(action)
                     state.play(seat, tile, end)
-                    cfg.last_actions.append(f"seat {seat} ({agent.name}): {format_action(tile, end)}")
+                    label = f"seat {seat} ({agent.name}): {format_action(tile, end)}"
+                    cfg.last_actions.append(label)
                     banner = f"seat {seat} ({agent.name}) to move" if not cfg.autoplay else banner
+                record(label)
                 next_ai_move = time.monotonic() + cfg.ai_delay
 
         # Your seat is subject to the same mandatory-play rule as the AI: when you
         # have no playable tile the pass is forced, so the loop must take it for
         # you instead of waiting for a click that can never come (the hand used to
         # stall here). The short pause is so the reason is readable on screen.
-        elif (playing and not cfg.autoplay and state.turn == cfg.human_seat
+        elif (live and not cfg.autoplay and state.turn == cfg.human_seat
                 and state.must_pass(cfg.human_seat)
                 and time.monotonic() >= next_ai_move):
             state.pass_turn(cfg.human_seat)
-            cfg.last_actions.append("you: pass (stuck)")
+            label = "you: pass (stuck)"
+            cfg.last_actions.append(label)
+            record(label)
             pending_tile = None
             banner = "no playable tile — you pass (the rules force it)"
             next_ai_move = time.monotonic() + cfg.ai_delay

@@ -9,9 +9,14 @@ Each of the three AI seats can be given its own agent with a repeatable
 ``--agent SEAT=KIND[:CHECKPOINT]``, so you can face, for example, the 15M network
 on one side and the rule bot on the other while the 4M network partners you.
 ``--ai-delay`` slows the AI down so you can follow the deal. The window is a
-table: your tiles are face up at the bottom, the three other seats show face-down
-tiles around it, and a finished hand is reported (who took the points, why, what
-each side was left holding) until you press SPACE for the next hand.
+table: your tiles are face up at the bottom, the other three seats sit around it
+and show what they hold (``--hide-hands`` keeps them face down), and a finished
+hand is reported -- who took the points, why, what each side was left holding --
+with buttons to replay that hand move by move or deal the next one.
+
+Controls: click a tile (then the framed end if it fits both), H shows/hides the
+other hands, R replays the hand (LEFT/RIGHT step, P plays it, R or ESC leaves),
+SPACE continues after a report, A autoplay, N new match, Q quits.
 
 Examples
 --------
@@ -71,8 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--match-to", type=int, default=100, dest="match_to",
                         help="match target in points")
     parser.add_argument("--fps", type=int, default=30, help="frame rate")
-    parser.add_argument("--ai-delay", type=float, default=0.7, dest="ai_delay",
+    parser.add_argument("--ai-delay", type=float, default=1.2, dest="ai_delay",
                         help="seconds the AI waits between its moves (0 = as fast as possible)")
+    parser.add_argument("--hide-hands", action="store_false", dest="reveal_hands",
+                        help="keep the other seats face down instead of showing their tiles "
+                             "(they are shown by default; H toggles while playing)")
     parser.add_argument("--autoplay", action="store_true",
                         help="let the AI play your seat too (demo mode)")
     return parser
@@ -99,6 +107,7 @@ def main(argv: list[str] | None = None) -> int:
         ai_delay=args.ai_delay,
         autoplay=args.autoplay,
         seat_agents=seat_agents,
+        reveal_hands=args.reveal_hands,
     )
     return run_play(cfg)
 

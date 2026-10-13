@@ -354,3 +354,42 @@ def test_a_finished_hand_is_reported_and_the_next_one_waits_for_you():
     longer = play(4500)
     assert len(longer.last_actions) == played, "the next hand must wait for the player"
     assert longer.last_summary == short.last_summary
+
+
+# --------------------------------------------------------------------------- #
+# The replay: every position of the hand is kept and can be walked through
+# --------------------------------------------------------------------------- #
+def test_the_whole_hand_is_recorded_so_it_can_be_replayed():
+    """One position per move, plus the deal: the replay has something to show."""
+    cfg = PlayConfig(human_seat=1, partner="rule", opponents="rule", autoplay=True,
+                     fps=0, ai_delay=0.0, seed=0)
+    run_play(cfg, max_frames=1500)
+    assert cfg.last_summary, "the hand should have finished"
+    assert cfg.history_len == len(cfg.last_actions) + 1, (
+        f"{cfg.history_len} positions kept for {len(cfg.last_actions)} moves"
+    )
+
+
+def test_replay_step_stays_inside_the_hand():
+    from domino.ui.play_loop import replay_step
+
+    assert replay_step(0, 1, 10) == 1
+    assert replay_step(9, 1, 10) == 9, "the last position is the end"
+    assert replay_step(0, -1, 10) == 0, "the first position is the deal"
+    assert replay_step(4, -2, 10) == 2
+    assert replay_step(0, 5, 1) == 0, "a one-position hand cannot move"
+
+
+def test_pressing_r_starts_the_replay_at_the_deal():
+    """R (or the report's button) walks the hand from its first position."""
+    import pygame
+
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_r))
+    cfg = PlayConfig(human_seat=1, partner="rule", opponents="rule", autoplay=True,
+                     fps=0, ai_delay=5.0, seed=0)
+    run_play(cfg, max_frames=3)
+    assert cfg.replay_index == 0, "the replay starts at the dealt position"
+    # the same frame's AI move is recorded too, so the index must be inside the hand
+    assert 0 <= cfg.replay_index < cfg.history_len
