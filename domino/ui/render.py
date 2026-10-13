@@ -249,6 +249,9 @@ class Renderer:
         self.seat_rects: dict[int, list[pygame.Rect]] = {}
         #: Click regions of the report's buttons, refreshed by ``draw_summary``.
         self.summary_buttons: dict[str, pygame.Rect] = {}
+        #: The always-visible restart button in the status bar (``None`` while the
+        #: end-of-hand report is up, which owns the clicks then).
+        self.restart_rect: pygame.Rect | None = None
 
     # -- input ------------------------------------------------------------
     def poll(self) -> list[pygame.event.Event]:
@@ -332,6 +335,7 @@ class Renderer:
             y += 25
 
         self.summary_buttons = {}
+        self.restart_rect = None                   # the report owns the clicks
         if buttons:
             button_y = box.bottom - 62
             x = box.x + 26
@@ -358,7 +362,11 @@ class Renderer:
         seat_labels: Mapping[int, str] | None,
         human_seat: int | None,
     ) -> None:
-        """The status strip: the match state on one line, the message on the next."""
+        """The status strip: the match state on one line, the message on the next.
+
+        It also carries the restart button, which is the one control always
+        available while a game is being played.
+        """
         x, y, width, height = regions["bar"]
         pygame.draw.rect(self.screen, PANEL, pygame.Rect(x, y, width, height))
         your_team = TEAM_OF_SEAT[1 if human_seat is None else human_seat]
@@ -369,14 +377,30 @@ class Renderer:
             turn = "you"
         else:
             turn = f"seat {acting_seat} ({(seat_labels or {}).get(acting_seat, 'AI')})"
+
+        self.restart_rect = self._draw_restart_button(width, y)
         status = (
             f"deal {state.deal_no}    match  your team {state.scores[your_team]}"
             f" : {state.scores[1 - your_team]} the AI team    open ends {ends}"
             f"    pass streak {state.pass_streak}/4    to play: {turn}"
         )
+        if x + 16 + self.small.size(status)[0] > self.restart_rect.x - 16:
+            status = (
+                f"deal {state.deal_no}   your team {state.scores[your_team]}"
+                f" : {state.scores[1 - your_team]} them   ends {ends}   to play: {turn}"
+            )
         self.screen.blit(self.small.render(status, True, TEXT), (x + 16, y + 10))
         if banner:
             self.screen.blit(self.big.render(banner, True, ACTING), (x + 16, y + 32))
+
+    def _draw_restart_button(self, width: int, y: int) -> pygame.Rect:
+        """Draw the bar's restart button and return its click region."""
+        text = self.small.render("RESTART  (N)", True, TEXT)
+        rect = pygame.Rect(width - text.get_width() - 44, y + 6, text.get_width() + 30, 30)
+        pygame.draw.rect(self.screen, BUTTON, rect, border_radius=7)
+        pygame.draw.rect(self.screen, BUTTON_EDGE, rect, width=2, border_radius=7)
+        self.screen.blit(text, (rect.x + 15, rect.y + 7))
+        return rect
 
     def _draw_seats(
         self,
@@ -615,7 +639,13 @@ class Renderer:
         return None
 
     def button_at(self, pos: tuple[int, int]) -> str | None:
-        """Return the key of the report button under ``pos`` (or ``None``)."""
+        """Return the key of the button under ``pos`` (or ``None``).
+
+        Covers the report's buttons and the status bar's restart button, so a
+        caller hit-tests one place for every on-screen control.
+        """
+        if self.restart_rect is not None and self.restart_rect.collidepoint(pos):
+            return "restart"
         for key, rect in self.summary_buttons.items():
             if rect.collidepoint(pos):
                 return key

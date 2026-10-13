@@ -16,7 +16,8 @@ with buttons to replay that hand move by move or deal the next one.
 
 Controls: click a tile (then the framed end if it fits both), H shows/hides the
 other hands, R replays the hand (LEFT/RIGHT step, P plays it, R or ESC leaves),
-SPACE continues after a report, A autoplay, N new match, Q quits.
+SPACE continues after a report, A autoplay, N or the RESTART button starts a
+different game (fresh deals), Q quits.
 
 Examples
 --------

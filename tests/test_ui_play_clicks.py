@@ -393,3 +393,51 @@ def test_pressing_r_starts_the_replay_at_the_deal():
     assert cfg.replay_index == 0, "the replay starts at the dealt position"
     # the same frame's AI move is recorded too, so the index must be inside the hand
     assert 0 <= cfg.replay_index < cfg.history_len
+
+
+# --------------------------------------------------------------------------- #
+# Starting a different game
+# --------------------------------------------------------------------------- #
+def _restart_click_frames():
+    """Post one click on the restart button, at the spot the renderer draws it."""
+    import pygame
+
+    from domino.engine import new_deal
+    from domino.ui.render import Renderer
+
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    probe = Renderer(size=(1280, 720))
+    probe.draw(new_deal(deal_no=1, rng=np.random.default_rng(0), lead_mode="six_six"),
+               human_seat=1, legal=[])
+    rect = probe.restart_rect
+    assert rect is not None
+    probe.close()
+    pygame.display.set_mode((1, 1))
+    pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, pos=rect.center, button=1))
+    return rect
+
+
+def test_the_restart_button_starts_a_different_game():
+    """Requested: "i want to play a different game, give me a restart button"."""
+    _restart_click_frames()
+    cfg = PlayConfig(human_seat=1, partner="rule", opponents="rule", seed=7,
+                     fps=0, ai_delay=5.0)
+    run_play(cfg, max_frames=3)
+    assert cfg.seed != 7, "a restart reseeds the deal stream: different deals"
+    assert cfg.history_len == 1, "and deals a fresh first hand"
+    assert cfg.last_actions == [], "with a clean log"
+
+
+def test_n_also_starts_a_different_game():
+    import pygame
+
+    pygame.init()
+    pygame.display.set_mode((1, 1))
+    pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_n))
+    cfg = PlayConfig(human_seat=1, partner="rule", opponents="rule", seed=7,
+                     fps=0, ai_delay=5.0)
+    run_play(cfg, max_frames=3)
+    assert cfg.seed != 7
+    assert cfg.history_len == 1
+    assert cfg.last_actions == []

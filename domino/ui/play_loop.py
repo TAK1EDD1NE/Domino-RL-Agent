@@ -347,13 +347,28 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
         next_replay = time.monotonic() + 0.4
         cfg.replay_index = replay
 
+    def start_new_game() -> GameState:
+        """Begin a different game: fresh scores and a fresh deal sequence.
+
+        A restart reseeds the deal stream (and remembers the seed in ``cfg.seed``,
+        so it stays reproducible with ``--seed``), rather than replaying the same
+        sequence: "a different game" has to mean different deals. The AI also
+        waits one beat, so the fresh table is visible before it moves.
+        """
+        nonlocal rng, scores, match_over, summary, next_plan, next_ai_move
+        seed = int(np.random.default_rng().integers(0, 2**31 - 1))
+        rng = np.random.default_rng(seed)
+        cfg.seed = seed
+        scores = [0, 0]
+        match_over, summary, next_plan = False, None, (None, 2)
+        cfg.last_actions.clear()
+        cfg.last_summary = []
+        next_ai_move = time.monotonic() + cfg.ai_delay
+        return new_deal(deal_no=1, rng=rng, lead_mode="six_six", scores=scores)
+
     def start_next_hand() -> GameState:
-        """Deal the hand the report promised (or a fresh match if it just ended)."""
-        nonlocal scores, match_over
+        """Deal the hand the report promised."""
         leader, deal_no = next_plan
-        if match_over:
-            scores = [0, 0]
-            leader, deal_no = None, 1
         return new_deal(
             deal_no=deal_no, rng=rng,
             lead_mode="six_six" if leader is None else "winner",
@@ -383,13 +398,14 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
             seat_labels=labels,
             reveal_hands=cfg.reveal_hands,
         )
-        if summary is not None:
+        if summary is not None and replay is None:
             renderer.draw_summary(
                 summary[1], title=summary[0],
                 hint=("R / the button replays this hand move by move    ·    "
-                      "SPACE or click for the next hand"),
-                buttons=((("new_match", "N — new match"),) if match_over else ())
-                + (("replay", "R — replay this hand"), ("next", "SPACE — next hand")),
+                      + ("SPACE or click for a new game" if match_over
+                         else "SPACE or click for the next hand")),
+                buttons=(("replay", "R — replay this hand"),
+                         ("next", "SPACE — new game" if match_over else "SPACE — next hand")),
             )
 
         for event in renderer.poll():
@@ -428,13 +444,14 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
                           f"(press H to switch)")
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
                 enter_replay()
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_n:
-                scores = [0, 0]
-                match_over, summary = False, None
-                state = new_deal(deal_no=1, rng=rng, lead_mode="six_six", scores=scores)
+            elif (event.type == pygame.KEYDOWN and event.key == pygame.K_n) or (
+                event.type == pygame.MOUSEBUTTONDOWN
+                and renderer.button_at(event.pos) == "restart"
+            ):
+                state = start_new_game()
                 pending_tile = None
                 reset_history()
-                banner = "your turn" if state.turn == cfg.human_seat else "AI thinking"
+                banner = f"new game — fresh deals (seed {cfg.seed})"
             elif summary is not None:
                 clicked = (renderer.button_at(event.pos)
                            if event.type == pygame.MOUSEBUTTONDOWN else None)
@@ -442,22 +459,19 @@ def run_play(cfg: PlayConfig | None = None, *, max_frames: int | None = None) ->
                     event.type == pygame.KEYDOWN and event.key == pygame.K_r
                 ):
                     enter_replay()
-                elif clicked == "new_match":
-                    scores = [0, 0]
-                    match_over, summary = False, None
-                    state = start_next_hand()
-                    pending_tile = None
-                    reset_history()
-                    banner = "new match — your turn"
                 elif clicked == "next" or (
                     event.type == pygame.KEYDOWN
                     and event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_KP_ENTER)
                 ):
-                    state = start_next_hand()
+                    if match_over:
+                        state = start_new_game()
+                        banner = f"new game — fresh deals (seed {cfg.seed})"
+                    else:
+                        state = start_next_hand()
+                        banner = "your turn" if state.turn == cfg.human_seat else "AI thinking"
                     summary = None
                     pending_tile = None
                     reset_history()
-                    banner = "your turn" if state.turn == cfg.human_seat else "AI thinking"
             elif event.type == pygame.MOUSEBUTTONDOWN and live and state.turn == cfg.human_seat:
                 before = (len(state.table), state.turn, state.pass_streak)
                 pending_tile, message = _human_click(state, cfg, renderer, event.pos, pending_tile)

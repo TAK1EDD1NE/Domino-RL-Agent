@@ -560,3 +560,28 @@ def test_the_report_buttons_are_returned_and_clickable():
         assert renderer.button_at(next_rect.center) == "next"
     finally:
         renderer.close()
+
+
+def test_the_restart_button_sits_in_the_status_bar_and_takes_clicks():
+    from domino.ui.render import BUTTON, table_geometry
+
+    state = _mid_deal_state()
+    renderer = Renderer(size=(1280, 720))
+    try:
+        renderer.draw(state, acting_seat=1, human_seat=1, legal=[])
+        rect = renderer.restart_rect
+        bar_x, bar_y, bar_w, bar_h = table_geometry(renderer.size)["bar"]
+        assert rect is not None, "the restart button is always drawn while playing"
+        assert bar_y <= rect.y and rect.bottom <= bar_y + bar_h, "it lives in the status bar"
+        assert bar_x <= rect.x and rect.right <= bar_x + bar_w, "and inside the window"
+        assert BUTTON in _region_colours(renderer, rect)
+        assert renderer.button_at(rect.center) == "restart"
+
+        # the report owns the clicks while it is up: its buttons answer, the bar's does not
+        renderer.draw_summary(["your team takes 12 points"],
+                              buttons=(("next", "SPACE — next hand"),))
+        assert renderer.restart_rect is None
+        assert renderer.button_at(rect.center) is None
+        assert renderer.button_at(renderer.summary_buttons["next"].center) == "next"
+    finally:
+        renderer.close()
