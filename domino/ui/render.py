@@ -1,16 +1,12 @@
 """Pygame rendering for the 2v2 domino table (interactive mode and replays).
 
 The renderer is the only place pygame is used; the training path never imports
-this package (there is a test asserting that). Doubles are drawn crosswise,
-exactly as they sit on a physical table, and the two open ends are shown
-explicitly in the info panel.
-
-One honest simplification: the engine stores the tiles of a deal in *play order*
-and keeps the two open end values, but it does not store which end each tile was
-attached to. The board is therefore drawn as the chronological line rather than
-reconstructing the physical left/right layout; the authoritative open ends are
-always displayed, so the game state shown is exact even though the tile order on
-screen is not the physical order.
+this package (there is a test asserting that). The line is laid out by
+:mod:`domino.ui.board`, which rebuilds the physical line from the engine's
+``(table, table_ends)``: tiles extend away from the opener on both sides, each
+one oriented so its matching number touches the line, and the two open ends are
+drawn where they really are (with their value) so a click picks the end it looks
+like. Doubles are drawn crosswise, exactly as they sit on a physical table.
 """
 from __future__ import annotations
 
@@ -21,20 +17,16 @@ import pygame
 
 from ..engine import GameState, PARTNER_OF_SEAT, TEAM_OF_SEAT
 from ..tiles import tile_pips, tile_values
+from .board import (
+    PANEL_W,
+    TILE_LONG,
+    TILE_SHORT,
+    LineLayout,
+    layout_line,
+)
 
-#: Tile geometry (pixels).
-TILE_LONG: int = 84
-TILE_SHORT: int = 42
 PIP_RADIUS: int = 4
 HAND_GAP: int = 8
-
-#: Size of the two "attach to this end" boxes drawn while a tile selected in the
-#: hand fits both open ends (the player clicks one of them to choose the end).
-END_MARKER_W: int = 176
-END_MARKER_H: int = 56
-END_MARKER_Y: int = 124
-#: Width of the right-hand info panel; the board stops there.
-PANEL_W: int = 330
 
 #: Colours.
 BG = (24, 84, 52)
@@ -81,14 +73,18 @@ def draw_tile(
     frame: tuple[int, int, int] | None = None,
     highlight: bool = False,
     dim: bool = False,
+    flipped: bool = False,
 ) -> pygame.Rect:
     """Draw one domino tile and return its rect.
 
     A normal tile is drawn long-and-horizontal with its two values left/right; a
     double is drawn crosswise (long-and-vertical), which is how it is laid on a
-    real table.
+    real table. ``flipped`` swaps the two halves, which is how the line orients a
+    tile so that its matching number touches the tile it was played against.
     """
     a, b = tile_values(tile)
+    if flipped:
+        a, b = b, a
     width, height = (TILE_SHORT, TILE_LONG) if crosswise else (TILE_LONG, TILE_SHORT)
     rect = pygame.Rect(top_left[0], top_left[1], width, height)
     body = TILE if not dim else (170, 168, 160)
@@ -126,6 +122,8 @@ class Renderer:
         self.small = pygame.font.Font(None, 17)
         self.big = pygame.font.Font(None, 26)
         self.hand_rects: dict[int, pygame.Rect] = {}
+        #: Click regions of the two open ends, refreshed by every board draw.
+        self.end_rects: dict[int, pygame.Rect] = {}
 
     # -- input ------------------------------------------------------------
     def poll(self) -> list[pygame.event.Event]:
@@ -164,58 +162,59 @@ class Renderer:
         each seat (interactive mode -- so you can see who you are facing).
         """
         self.screen.fill(BG)
-        self._draw_board(state, acting_seat)
+        self._draw_board(state, acting_seat, ambiguous_ends or ())
         self._draw_panel(state, acting_seat, banner, last_actions, overlay, human_seat, seat_labels)
-        if ambiguous_ends:
-            self._draw_end_markers(state, ambiguous_ends)
         if human_seat is not None:
             self._draw_hand(state, human_seat, legal or [], selected, ambiguous_ends or [])
 
-    def _draw_end_markers(self, state: GameState, ambiguous_ends: Sequence[int]) -> None:
-        """Draw the two clickable end boxes for an ambiguous tile.
+    def _draw_open_ends(
+        self, state: GameState, layout: LineLayout, ambiguous_ends: Sequence[int]
+    ) -> None:
+        """Frame the two ends of the line and label them with their value.
 
-        The selected tile fits both open ends, so the player picks which value
-        stays open by clicking one of these boxes; each shows the value that end
-        currently exposes.
+        A selected hand tile that fits both ends makes the choice explicit: the
+        two frames light up in the 'acting' colour, and each frame covers exactly
+        the region :meth:`end_at` maps back to that end.
         """
-        left, right = end_marker_rects(self.size)
-        for rect, end in ((left, 0), (right, 1)):
+        for end, rect in sorted(layout.ends.items()):
             active = end in ambiguous_ends
-            pygame.draw.rect(self.screen, PANEL, rect, border_radius=8)
-            pygame.draw.rect(
-                self.screen, ACTING if active else TILE_EDGE, rect, width=3 if active else 2,
-                border_radius=8,
+            value = state.ends[end] if end < len(state.ends) else None
+            colour = ACTING if active else LEGAL
+            pygame.draw.rect(self.screen, colour, rect, width=3, border_radius=6)
+            label = f"end {end} = {value}" if value is not None else f"end {end}"
+            text = self.small.render(
+                f"{label} - click here" if active else label, True, colour
             )
-            value = state.ends[end] if end < len(state.ends) else "?"
-            colour = ACTING if active else MUTED
-            self.screen.blit(
-                self.small.render(f"end {end} = {value}", True, colour), (rect.x + 12, rect.y + 8)
-            )
-            self.screen.blit(
-                self.small.render("click to attach here" if active else "not available", True,
-                                  TEXT if active else MUTED),
-                (rect.x + 12, rect.y + 30),
-            )
+            y = min(rect.bottom + 2, self.size[1] - TILE_LONG - 60)
+            self.screen.blit(text, (rect.x, y))
 
-    def _draw_board(self, state: GameState, acting_seat: int | None) -> None:
+    def _draw_board(
+        self,
+        state: GameState,
+        acting_seat: int | None,
+        ambiguous_ends: Sequence[int] = (),
+    ) -> None:
+        self.end_rects = {}
         if not state.table:
             text = self.big.render("table empty — the leader opens", True, MUTED)
             self.screen.blit(text, (40, 180))
             return
-        x, y = 40, 200
-        for tile in state.table:
-            a, b = tile_values(tile)
-            crosswise = a == b
-            rect = draw_tile(self.screen, tile, (x, y), crosswise=crosswise)
-            x += rect.width + 4
-            if x > self.size[0] - PANEL_W - 20:  # wrap before running under the panel
-                x, y = 40, y + TILE_LONG + 12
+        layout = layout_line(state, self.size)
+        for placed in layout.tiles:
+            a, b = tile_values(placed.tile)
+            draw_tile(
+                self.screen, placed.tile, placed.rect.topleft,
+                crosswise=a == b, flipped=placed.flip,
+            )
+        self.end_rects = dict(layout.ends)
+        self._draw_open_ends(state, layout, ambiguous_ends)
         if acting_seat is not None:
+            bottom = max(placed.rect.bottom for placed in layout.tiles)
             label = self.small.render(
                 f"seat {acting_seat} (team {TEAM_OF_SEAT[acting_seat]}) to play",
                 True, ACTING,
             )
-            self.screen.blit(label, (40, y + TILE_LONG + 20))
+            self.screen.blit(label, (40, min(bottom + 26, self.size[1] - TILE_LONG - 50)))
 
     def _draw_panel(
         self,
@@ -321,33 +320,18 @@ class Renderer:
         return None
 
     def end_at(self, pos: tuple[int, int], state: GameState, ends: Sequence[int]) -> int | None:
-        """Map a click on one of the two end boxes to that end's index.
+        """Map a click on one of the two framed ends to that end's index.
 
-        The boxes are the ones :func:`end_marker_rects` draws, so the target the
-        player sees is the target the click tests.
-        """
+        The frames are the ones :meth:`_draw_board` drew (the outer half of the
+        tile at each end of the line), so the target the player sees is the target
+        the click tests. Returns ``None`` when there is no end to choose, or the
+        click missed both."""
         if len(ends) < 2:
             return None
-        left, right = end_marker_rects(self.size)
-        if left.collidepoint(pos):
-            return 0
-        if right.collidepoint(pos):
-            return 1
+        for end, rect in sorted(self.end_rects.items()):
+            if rect.collidepoint(pos):
+                return end
         return None
-
-
-def end_marker_rects(size: tuple[int, int]) -> tuple[pygame.Rect, pygame.Rect]:
-    """The two clickable 'attach to this end' boxes (end 0 left, end 1 right).
-
-    They sit above the board rows so they never cover the tiles, and they are the
-    hit boxes :meth:`Renderer.end_at` tests, so what is drawn is exactly what is
-    clickable.
-    """
-    left = pygame.Rect(20, END_MARKER_Y, END_MARKER_W, END_MARKER_H)
-    right = pygame.Rect(
-        size[0] - PANEL_W - 20 - END_MARKER_W, END_MARKER_Y, END_MARKER_W, END_MARKER_H
-    )
-    return left, right
 
 
 def format_action(tile: int, end: int | None = None) -> str:

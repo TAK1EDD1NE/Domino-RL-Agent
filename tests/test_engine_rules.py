@@ -167,3 +167,52 @@ def test_second_deal_leader_is_first_deal_winner_with_free_lead():
     assert deal2_no == next_deal_no
     assert leader2 == turn2 == seat2 == first.winning_seat   # previous winner leads
     assert legal2 == hand2                       # free lead: the whole hand is playable
+
+
+# --------------------------------------------------------------------------- #
+# table_ends: the side each tile was really attached to
+# --------------------------------------------------------------------------- #
+def test_table_ends_records_one_side_per_table_tile():
+    s = fresh()
+    s.play(s.turn, SIX_SIX_ID)                   # the opener defines both ends
+    assert s.table_ends == [0]
+    while not s.is_terminal():
+        seat = s.turn
+        legal = s.legal_moves(seat)
+        if not legal:
+            s.pass_turn(seat)
+            continue
+        tile, end = legal[0]
+        s.play(seat, tile, end)
+    assert len(s.table_ends) == len(s.table)
+    assert s.table_ends[0] == 0
+    assert set(s.table_ends) <= {0, 1}
+
+
+def test_table_ends_records_the_placement_used_not_the_one_requested():
+    """A one-sided tile asked for the wrong end still reports where it went.
+
+    ``moves`` keeps the requested end (it is an observation feature), while
+    ``table_ends`` -- what the UI draws from -- must carry the side the engine
+    really placed the tile on.
+    """
+    s = fresh(3)
+    s.play(s.turn, SIX_SIX_ID)
+    seat = s.turn
+    legal = s.legal_moves(seat)
+    one_sided = [(t, e) for (t, e) in legal if sum(1 for x, _ in legal if x == t) == 1]
+    assert one_sided, "expected a tile playable on one end only in this deal"
+    tile, actual = one_sided[0]
+    requested = 1 - actual
+    s.play(seat, tile, requested)
+    assert s.table_ends[-1] == actual
+    assert s.moves[-1] == (seat, tile, requested)
+
+
+def test_table_ends_survives_a_clone():
+    s = fresh(1)
+    s.play(s.turn, SIX_SIX_ID)
+    clone = s.clone()
+    assert clone.table_ends == s.table_ends
+    clone.table_ends.append(1)
+    assert clone.table_ends != s.table_ends, "clone must not share the list"

@@ -88,6 +88,14 @@ class GameState:
     #: only shrink in this game (no boneyard), so a lack is monotone: once a
     #: value is known to be absent it never comes back.
     lacks: list[set[int]] = field(default_factory=lambda: [set() for _ in range(SEATS)])
+    #: Per tile on :attr:`table` (same order), the end index it was **actually**
+    #: attached to: 0 = left, 1 = right. The opening tile defines both ends and is
+    #: recorded as 0. This is deliberately separate from the third element of
+    #: :attr:`moves`, which stores what the caller *asked* for (agents may ask for
+    #: the wrong side of a one-sided tile, and ``Match.play_deal`` passes no end at
+    #: all): ``moves`` is an observation feature and must keep its meaning, while
+    #: the UI needs the placement the engine really applied to draw the line.
+    table_ends: list[int] = field(default_factory=list)
 
     # ---- construction -------------------------------------------------
     def clone(self) -> "GameState":
@@ -107,6 +115,7 @@ class GameState:
             forced_leader_six_six=self.forced_leader_six_six,
             moves=list(self.moves),
             lacks=[set(values) for values in self.lacks],
+            table_ends=list(self.table_ends),
         )
 
     # ---- queries ------------------------------------------------------
@@ -207,12 +216,15 @@ class GameState:
         if not self.table:                       # free lead: expose the tile's two values
             a, b = tile_values(tid)
             new_ends = [a, b]                     # a double leads to two equal ends, e.g. [6, 6]
+            placed_end = 0                        # the opener is the line: it has no side
         else:
             placements = self._tile_placements(tid)
             chosen = next((p for p in placements if p[0] == end), placements[0])
             new_ends = chosen[1]
+            placed_end = chosen[0]                # the side really used, not the requested one
         self.hands[seat].remove(tid)
         self.table.append(tid)
+        self.table_ends.append(int(placed_end))
         self.played_by[seat].append(tid)
         self.moves.append((int(seat), int(tid), int(end)))
         self.ends = new_ends

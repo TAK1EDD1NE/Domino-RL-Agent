@@ -19,7 +19,7 @@ import pytest  # noqa: E402
 
 from domino.agents import RandomAgent, RuleAgent  # noqa: E402
 from domino.engine import new_deal  # noqa: E402
-from domino.tiles import SIX_SIX_ID, tile_id  # noqa: E402
+from domino.tiles import SIX_SIX_ID, tile_id, tile_values  # noqa: E402
 from domino.ui.observe_loop import ObserveConfig, action_probabilities, run_observe  # noqa: E402
 from domino.ui.play_loop import (  # noqa: E402
     PlayConfig,
@@ -82,26 +82,120 @@ def test_action_text_helpers():
     assert describe_hand([tile_id(6, 6)]) == "[6|6] (12 pips)"
 
 
-def test_ambiguous_tile_draws_the_end_boxes_it_makes_clickable():
+def test_ambiguous_tile_draws_the_end_frames_it_makes_clickable():
     """A tile fitting both ends must show the two targets the click tests."""
-    from domino.ui.render import ACTING, end_marker_rects
+    from domino.ui.render import ACTING
 
-    state = _mid_deal_state()
+    state = _mid_deal_state()          # [6|6] on the table: ends [6, 6]
     renderer = Renderer(size=(1280, 720))
     try:
         renderer.draw(state, acting_seat=1, human_seat=1, legal=[], selected=tile_id(6, 3),
                       ambiguous_ends=[0, 1], banner="fits both ends")
-        left, right = end_marker_rects(renderer.size)
-        # the boxes are actually painted (highlighted border) where they are hit
-        assert renderer.screen.get_at((left.x + 1, left.centery))[:3] == ACTING
-        assert renderer.screen.get_at((right.x + 1, right.centery))[:3] == ACTING
-        assert renderer.end_at(left.center, state, state.ends) == 0
-        assert renderer.end_at(right.center, state, state.ends) == 1
+        assert set(renderer.end_rects) == {0, 1}
+        left_rect, right_rect = renderer.end_rects[0], renderer.end_rects[1]
+        # the frames are painted where they are hit, and they sit on the line
+        assert renderer.screen.get_at((left_rect.x + 1, left_rect.centery))[:3] == ACTING
+        assert renderer.screen.get_at((right_rect.right - 2, right_rect.centery))[:3] == ACTING
+        assert renderer.end_at(left_rect.center, state, state.ends) == 0
+        assert renderer.end_at(right_rect.center, state, state.ends) == 1
         # nowhere else, and no end choice at all on a single-ended table
-        assert renderer.end_at((600, 400), state, state.ends) is None
-        assert renderer.end_at(left.center, state, [6]) is None
+        assert renderer.end_at((640, 560), state, state.ends) is None
+        assert renderer.end_at(left_rect.center, state, [6]) is None
     finally:
         renderer.close()
+
+
+def test_board_draws_the_line_on_both_sides_of_the_opener():
+    """The reported bug, end-to-end on the pixels: nothing piles onto one side."""
+    from domino.ui import render as render_module
+
+    state = _scripted_state(seed=0)
+    assert len(state.table) >= 4, "the scripted deal should put a few tiles down"
+    renderer = Renderer(size=(1280, 720))
+    try:
+        renderer.draw(state, acting_seat=1, human_seat=1, legal=[], last_actions=[])
+        painted = [
+            x for x in range(0, 1280 - 330) for y in range(190, 520, 7)
+            if renderer.screen.get_at((x, y))[:3] == render_module.TILE
+        ]
+        assert painted, "the board must have drawn tiles"
+        opener = _opener_rect(state, renderer)
+        assert min(painted) < opener.left, "no tile drawn left of the opener"
+        assert max(painted) > opener.right, "no tile drawn right of the opener"
+    finally:
+        renderer.close()
+
+
+def test_the_renderer_draws_a_reversed_tile_reversed():
+    """The line's orientation must reach the screen, not just the layout."""
+    from domino.ui.board import layout_line
+
+    state = _scripted_state(seed=0)
+    layout = layout_line(state, (1280, 720))
+    # skip the two extreme tiles: the open-end frames are painted over them
+    reversed_tiles = [
+        placed for index, placed in enumerate(layout.tiles)
+        if placed.flip and 0 < index < len(layout.tiles) - 1
+    ]
+    assert reversed_tiles, "the scripted deal should need at least one tile turned round"
+    renderer = Renderer(size=(1280, 720))
+    try:
+        renderer.draw(state, acting_seat=1, human_seat=1, legal=[], last_actions=[])
+        for placed in reversed_tiles[:2]:
+            drawn = renderer.screen.subsurface(placed.rect).copy()
+            straight = _render_tile_offline(placed.tile, flip=False)
+            turned = _render_tile_offline(placed.tile, flip=True)
+            assert _pixels(drawn) == _pixels(turned), (
+                f"tile {tile_values(placed.tile)} must be drawn turned round"
+            )
+            assert _pixels(drawn) != _pixels(straight)
+    finally:
+        renderer.close()
+
+
+def _render_tile_offline(tile: int, *, flip: bool):
+    """The same tile drawn alone on the board background, for pixel comparison."""
+    import pygame
+
+    from domino.ui import render as render_module
+    from domino.ui.board import tile_height, tile_width
+
+    surface = pygame.Surface((tile_width(tile), tile_height(tile)))
+    surface.fill(render_module.BG)
+    draw_tile(surface, tile, (0, 0), crosswise=tile_values(tile)[0] == tile_values(tile)[1],
+              flipped=flip)
+    return surface
+
+
+def _pixels(surface) -> list[tuple[int, int, int]]:
+    return [
+        surface.get_at((x, y))[:3]
+        for x in range(surface.get_width())
+        for y in range(surface.get_height())
+    ]
+
+
+def _opener_rect(state, renderer):
+    from domino.ui.board import line_tiles, layout_line
+
+    ordered, anchor = line_tiles(state)
+    layout = layout_line(state, renderer.size)
+    return next(p.rect for p in layout.tiles if p.tile == ordered[anchor][0])
+
+
+def _scripted_state(seed: int = 0):
+    """A deal with a handful of tiles played on both ends."""
+    state = new_deal(deal_no=1, rng=np.random.default_rng(seed), lead_mode="six_six")
+    state.play(state.turn, SIX_SIX_ID)
+    for wanted in (0, 1, 1, 0):
+        seat = state.turn
+        options = state.legal_moves(seat)
+        if not options:
+            state.pass_turn(seat)
+            continue
+        tile, end = next(((t, e) for t, e in options if e == wanted), options[0])
+        state.play(seat, tile, end)
+    return state
 
 
 # --------------------------------------------------------------------------- #
