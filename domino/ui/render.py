@@ -14,7 +14,7 @@ screen is not the physical order.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 import os
 
 import pygame
@@ -27,6 +27,14 @@ TILE_LONG: int = 84
 TILE_SHORT: int = 42
 PIP_RADIUS: int = 4
 HAND_GAP: int = 8
+
+#: Size of the two "attach to this end" boxes drawn while a tile selected in the
+#: hand fits both open ends (the player clicks one of them to choose the end).
+END_MARKER_W: int = 176
+END_MARKER_H: int = 56
+END_MARKER_Y: int = 124
+#: Width of the right-hand info panel; the board stops there.
+PANEL_W: int = 330
 
 #: Colours.
 BG = (24, 84, 52)
@@ -146,18 +154,48 @@ class Renderer:
         last_actions: Sequence[str] = (),
         selected: int | None = None,
         ambiguous_ends: Sequence[int] | None = None,
+        seat_labels: Mapping[int, str] | None = None,
     ) -> None:
         """Render one frame of ``state``.
 
         ``human_seat`` enables the clickable hand row; ``legal`` marks playable
         tiles; ``overlay`` draws per-action probability bars (replay mode);
-        ``banner`` is the status line.
+        ``banner`` is the status line; ``seat_labels`` names the agent sitting in
+        each seat (interactive mode -- so you can see who you are facing).
         """
         self.screen.fill(BG)
         self._draw_board(state, acting_seat)
-        self._draw_panel(state, acting_seat, banner, last_actions, overlay)
+        self._draw_panel(state, acting_seat, banner, last_actions, overlay, human_seat, seat_labels)
+        if ambiguous_ends:
+            self._draw_end_markers(state, ambiguous_ends)
         if human_seat is not None:
             self._draw_hand(state, human_seat, legal or [], selected, ambiguous_ends or [])
+
+    def _draw_end_markers(self, state: GameState, ambiguous_ends: Sequence[int]) -> None:
+        """Draw the two clickable end boxes for an ambiguous tile.
+
+        The selected tile fits both open ends, so the player picks which value
+        stays open by clicking one of these boxes; each shows the value that end
+        currently exposes.
+        """
+        left, right = end_marker_rects(self.size)
+        for rect, end in ((left, 0), (right, 1)):
+            active = end in ambiguous_ends
+            pygame.draw.rect(self.screen, PANEL, rect, border_radius=8)
+            pygame.draw.rect(
+                self.screen, ACTING if active else TILE_EDGE, rect, width=3 if active else 2,
+                border_radius=8,
+            )
+            value = state.ends[end] if end < len(state.ends) else "?"
+            colour = ACTING if active else MUTED
+            self.screen.blit(
+                self.small.render(f"end {end} = {value}", True, colour), (rect.x + 12, rect.y + 8)
+            )
+            self.screen.blit(
+                self.small.render("click to attach here" if active else "not available", True,
+                                  TEXT if active else MUTED),
+                (rect.x + 12, rect.y + 30),
+            )
 
     def _draw_board(self, state: GameState, acting_seat: int | None) -> None:
         if not state.table:
@@ -170,7 +208,7 @@ class Renderer:
             crosswise = a == b
             rect = draw_tile(self.screen, tile, (x, y), crosswise=crosswise)
             x += rect.width + 4
-            if x > self.size[0] - 140:  # wrap onto a second row
+            if x > self.size[0] - PANEL_W - 20:  # wrap before running under the panel
                 x, y = 40, y + TILE_LONG + 12
         if acting_seat is not None:
             label = self.small.render(
@@ -186,8 +224,10 @@ class Renderer:
         banner: str,
         last_actions: Sequence[str],
         overlay: Sequence[float] | None,
+        human_seat: int | None = None,
+        seat_labels: Mapping[int, str] | None = None,
     ) -> None:
-        panel = pygame.Rect(self.size[0] - 330, 0, 330, self.size[1])
+        panel = pygame.Rect(self.size[0] - PANEL_W, 0, PANEL_W, self.size[1])
         pygame.draw.rect(self.screen, PANEL, panel)
         lines: list[tuple[str, tuple[int, int, int]]] = [
             (f"deal {state.deal_no}", TEXT),
@@ -199,10 +239,11 @@ class Renderer:
         for seat in range(4):
             marker = "->" if seat == acting_seat else "  "
             partner = PARTNER_OF_SEAT[seat]
+            who = "you" if seat == human_seat else (seat_labels or {}).get(seat, "")
             lines.append(
                 (
-                    f"{marker} seat {seat}  tiles {state.hand_size(seat)}  pips {state.pips(seat)}"
-                    f"  (partner {partner})",
+                    f"{marker} seat {seat}  {state.hand_size(seat)}t {state.pips(seat)}p"
+                    f"  {who} (p{partner})",
                     ACTING if seat == acting_seat else MUTED,
                 )
             )
@@ -280,16 +321,33 @@ class Renderer:
         return None
 
     def end_at(self, pos: tuple[int, int], state: GameState, ends: Sequence[int]) -> int | None:
-        """Map a click near a board end to that end's index (for ambiguous tiles)."""
+        """Map a click on one of the two end boxes to that end's index.
+
+        The boxes are the ones :func:`end_marker_rects` draws, so the target the
+        player sees is the target the click tests.
+        """
         if len(ends) < 2:
             return None
-        left = pygame.Rect(20, 180, 80, TILE_LONG + 40)
-        right = pygame.Rect(self.size[0] - 420, 180, 80, TILE_LONG + 40)
+        left, right = end_marker_rects(self.size)
         if left.collidepoint(pos):
             return 0
         if right.collidepoint(pos):
             return 1
         return None
+
+
+def end_marker_rects(size: tuple[int, int]) -> tuple[pygame.Rect, pygame.Rect]:
+    """The two clickable 'attach to this end' boxes (end 0 left, end 1 right).
+
+    They sit above the board rows so they never cover the tiles, and they are the
+    hit boxes :meth:`Renderer.end_at` tests, so what is drawn is exactly what is
+    clickable.
+    """
+    left = pygame.Rect(20, END_MARKER_Y, END_MARKER_W, END_MARKER_H)
+    right = pygame.Rect(
+        size[0] - PANEL_W - 20 - END_MARKER_W, END_MARKER_Y, END_MARKER_W, END_MARKER_H
+    )
+    return left, right
 
 
 def format_action(tile: int, end: int | None = None) -> str:

@@ -15,12 +15,20 @@ import subprocess  # noqa: E402
 import sys  # noqa: E402
 
 import numpy as np  # noqa: E402
+import pytest  # noqa: E402
 
 from domino.agents import RandomAgent, RuleAgent  # noqa: E402
 from domino.engine import new_deal  # noqa: E402
 from domino.tiles import SIX_SIX_ID, tile_id  # noqa: E402
 from domino.ui.observe_loop import ObserveConfig, action_probabilities, run_observe  # noqa: E402
-from domino.ui.play_loop import PlayConfig, run_play  # noqa: E402
+from domino.ui.play_loop import (  # noqa: E402
+    PlayConfig,
+    _build_agents,
+    agent_label,
+    parse_seat_agent,
+    run_play,
+    seat_labels,
+)
 from domino.ui.render import Renderer, describe_hand, draw_tile, format_action  # noqa: E402
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -74,6 +82,28 @@ def test_action_text_helpers():
     assert describe_hand([tile_id(6, 6)]) == "[6|6] (12 pips)"
 
 
+def test_ambiguous_tile_draws_the_end_boxes_it_makes_clickable():
+    """A tile fitting both ends must show the two targets the click tests."""
+    from domino.ui.render import ACTING, end_marker_rects
+
+    state = _mid_deal_state()
+    renderer = Renderer(size=(1280, 720))
+    try:
+        renderer.draw(state, acting_seat=1, human_seat=1, legal=[], selected=tile_id(6, 3),
+                      ambiguous_ends=[0, 1], banner="fits both ends")
+        left, right = end_marker_rects(renderer.size)
+        # the boxes are actually painted (highlighted border) where they are hit
+        assert renderer.screen.get_at((left.x + 1, left.centery))[:3] == ACTING
+        assert renderer.screen.get_at((right.x + 1, right.centery))[:3] == ACTING
+        assert renderer.end_at(left.center, state, state.ends) == 0
+        assert renderer.end_at(right.center, state, state.ends) == 1
+        # nowhere else, and no end choice at all on a single-ended table
+        assert renderer.end_at((600, 400), state, state.ends) is None
+        assert renderer.end_at(left.center, state, [6]) is None
+    finally:
+        renderer.close()
+
+
 # --------------------------------------------------------------------------- #
 # Loops (headless)
 # --------------------------------------------------------------------------- #
@@ -85,6 +115,85 @@ def test_observe_loop_runs_headless():
 def test_play_loop_runs_headless_in_autoplay():
     cfg = PlayConfig(partner="rule", opponents="random", autoplay=True, fps=30)
     assert run_play(cfg, max_frames=80) == 0
+
+
+# --------------------------------------------------------------------------- #
+# Per-seat agents (three different agents at the three AI seats)
+# --------------------------------------------------------------------------- #
+def test_parse_seat_agent_reads_kind_and_checkpoint():
+    assert parse_seat_agent("rule") == ("rule", None)
+    assert parse_seat_agent("RL") == ("rl", None)
+    assert parse_seat_agent("rl:models/checkpoints/ppo_4001502_steps.zip") == (
+        "rl", "models/checkpoints/ppo_4001502_steps.zip",
+    )
+    # a Windows path keeps all of its characters: only the first colon splits
+    assert parse_seat_agent(r"rl:C:\Users\pc\models\latest.zip") == (
+        "rl", r"C:\Users\pc\models\latest.zip",
+    )
+    with pytest.raises(ValueError, match="unknown agent kind"):
+        parse_seat_agent("mcts")
+
+
+def test_agent_label_names_the_training_stage():
+    assert agent_label("rl", "models/checkpoints/ppo_4001502_steps.zip") == "rl-4.0M"
+    assert agent_label("rl", "models/checkpoints/ppo_15002766_steps.zip") == "rl-15.0M"
+    assert agent_label("rl", "models/checkpoints/latest.zip") == "rl-latest"
+    assert agent_label("rl", None) == "rl"
+    assert agent_label("rule") == "rule"
+    assert agent_label("random") == "random"
+
+
+def test_seat_agents_can_differ_and_defaults_are_untouched():
+    """Each AI seat gets its own kind; unspecified seats keep partner/opponents."""
+    cfg = PlayConfig(human_seat=1, partner="rule", opponents="random",
+                     seat_agents={0: "rule", 2: "random"})
+    agents = _build_agents(cfg)
+    assert sorted(agents) == [0, 2, 3]
+    assert isinstance(agents[3], RuleAgent)          # partner default
+    assert agents[3].name == "rule"
+    # the two opponents are distinguishable now: seat 0 was overridden, seat 2
+    # kept the configured default, and neither shares an object with the other
+    assert agents[0] is not agents[2]
+    assert {agents[0].name, agents[2].name} == {"rule", "random"}
+    labels = seat_labels(agents, cfg.human_seat)
+    assert labels[1] == "you" and labels[3] == "rule"
+
+
+def test_seat_agents_reject_the_human_seat_and_bad_specs():
+    with pytest.raises(ValueError, match="human seat"):
+        _build_agents(PlayConfig(human_seat=1, partner="rule", opponents="rule",
+                                 seat_agents={1: "rule"}))
+    with pytest.raises(ValueError, match="unknown agent kind"):
+        _build_agents(PlayConfig(human_seat=1, partner="rule", opponents="rule",
+                                 seat_agents={0: "nope"}))
+
+
+def test_seat_agents_missing_checkpoint_fails_before_the_window_opens():
+    with pytest.raises(FileNotFoundError, match="checkpoint for seat 0 not found"):
+        _build_agents(PlayConfig(human_seat=1, partner="rule", opponents="rule",
+                                 seat_agents={0: "rl:models/checkpoints/nope.zip"},
+                                 model="models/checkpoints/nope.zip"))
+
+
+def test_play_cli_parses_repeated_agent_flags(monkeypatch):
+    """`--agent` reaches PlayConfig as {seat: spec}; the window is not opened."""
+    import play
+
+    seen: dict[str, object] = {}
+
+    def fake_run_play(cfg):
+        seen["cfg"] = cfg
+        return 0
+
+    monkeypatch.setattr(play, "run_play", fake_run_play)
+    code = play.main(["--human-seat", "1", "--agent", "0=rule", "--agent",
+                      "2=rl:models/checkpoints/ppo_4001502_steps.zip"])
+    assert code == 0
+    assert seen["cfg"].seat_agents == {0: "rule", 2: "rl:models/checkpoints/ppo_4001502_steps.zip"}
+    with pytest.raises(SystemExit, match="your own seat"):
+        play.main(["--human-seat", "1", "--agent", "1=rule"])
+    with pytest.raises(SystemExit, match="SEAT=KIND"):
+        play.main(["--human-seat", "1", "--agent", "rule"])
 
 
 def test_action_probabilities_is_none_without_a_policy():
