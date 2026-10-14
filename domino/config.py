@@ -74,6 +74,18 @@ class TrainConfig:
     entropy_floor_enabled: bool = True
     entropy_floor: float = 0.05
     min_entropy: float = 0.1
+    #: Public-information value head (search plan item (a)): a second value head on the
+    #: actor's public features, trained on PPO's own returns by its own callback. It is the
+    #: only play-time value the agent has; the centralised critic reads the true hands.
+    public_value_enabled: bool = True
+    #: MSE weight. Much smaller than belief_coef on purpose: this head's targets are point
+    #: differences in the tens, so its loss is ~10^2 where the belief BCE is ~0.5 nats.
+    public_value_coef: float = 0.1
+    public_value_lr: float = 3e-4
+    public_value_batch: int = 256
+    #: Auxiliary updates every N rollout steps (same measured trade-off as belief_every:
+    #: every=1 costs ~3x throughput at 6 workers).
+    public_value_every: int = 8
     #: PIMC determinisations at inference (item 5); 0 disables search.
     search_k: int = 0
 

@@ -39,6 +39,7 @@ import numpy as np
 from ..engine import GameState, TEAM_OF_SEAT
 from ..masks import action_index
 from ..tiles import tile_pips
+from .leaf import NET_LEAF_MODES, NetLeaf
 from .policy_search import PolicySearchResult, policy_solve
 from .sampler import PublicView, World, sample_worlds
 from .solver import LEAF_MODES, Solver
@@ -88,6 +89,7 @@ class PIMCAgent:
                  method: str = "auto", tt_bits: int = 20, node_limit: Optional[int] = None,
                  seed: Optional[int] = 0, opponent_model: str = "min",
                  opponent_policy: Optional[Callable] = None, exact_when_short: bool = True,
+                 model: Optional[object] = None, root_all_moves: bool = False,
                  log: Optional[Callable[[str], None]] = None,
                  sampler: Optional[Callable[[PublicView, int, np.random.Generator],
                                             list[World]]] = None,
@@ -102,8 +104,13 @@ class PIMCAgent:
             raise ValueError(f"unknown opponent_model {opponent_model!r}")
         if opponent_model == "policy" and opponent_policy is None:
             raise ValueError("opponent_model='policy' needs an opponent_policy")
-        if isinstance(leaf_eval, str) and leaf_eval not in LEAF_MODES:
+        if isinstance(leaf_eval, str) and leaf_eval not in (*LEAF_MODES, *NET_LEAF_MODES):
             raise ValueError(f"unknown leaf_eval {leaf_eval!r}")
+        if leaf_eval in NET_LEAF_MODES and model is None:
+            raise ValueError(
+                f"leaf_eval={leaf_eval!r} needs a trained model (pass model=<MaskablePPO>); "
+                "the compiled backend cannot call a network from inside its kernel"
+            )
         self.worlds = int(worlds)
         self.horizon = int(horizon)
         self.time_budget = float(time_budget)
@@ -119,6 +126,14 @@ class PIMCAgent:
         self.opponent_model = str(opponent_model)
         self.opponent_policy = opponent_policy
         self.exact_when_short = bool(exact_when_short)
+        #: One exact solve per world for the whole root instead of one per move. Only changes
+        #: the *cost* (and the magnitudes of non-best entries, which become pruning bounds):
+        #: the argmax over moves is identical. This is what makes an exact teacher affordable
+        #: for offline target generation.
+        self.root_all_moves = bool(root_all_moves)
+        #: The trained network behind ``leaf_eval in NET_LEAF_MODES``.
+        self.model = model
+        self._net_leaf: Optional[NetLeaf] = None
         self._log = log
         self._sampler = sampler
         self.last_report = MoveReport()
@@ -126,6 +141,7 @@ class PIMCAgent:
             self.name = name
         self._solver: Optional[Solver] = None
         self._solver_depth: Optional[int] = None
+        self._solver_leaf: Optional[str] = None
 
     # ---- public API -----------------------------------------------------
     def act(self, state: GameState, seat: int) -> int:
@@ -143,7 +159,9 @@ class PIMCAgent:
         started = time.perf_counter()
         depth = self._depth_for(state)
         view = PublicView.from_state(state, int(seat))
-        if self.opponent_model == "policy":
+        if self.leaf_eval in NET_LEAF_MODES and depth is not None:
+            self._score_net_leaf(state, moves, view, report, started)
+        elif self.opponent_model == "policy":
             self._score_policy(state, moves, view, depth, report, started)
         else:
             self._score_minimax(state, moves, view, depth, report, started)
@@ -221,12 +239,66 @@ class PIMCAgent:
         masks = world.masks()
         pips = _pips_of_masks(masks)
         raw: dict[tuple[int, int], int] = {}
+        if self.root_all_moves and solver.max_depth is None:
+            # One exact solve for the whole root instead of one per move: with an exact
+            # (depth-free) search the table is shared and the answer is the same ranking, at
+            # roughly 1/len(moves) of the cost. Non-best entries in ``move_values`` can be
+            # pruning bounds rather than exact magnitudes, which is all an argmax target needs.
+            result = solver.solve_arrays(masks, left, right, seat, pass_streak, pips, moves)
+            for move in moves:
+                value = int(result.move_values.get(move, 0)) if result.complete else 0
+                raw[move] = value
+                report.values[move] = report.values.get(move, 0.0) + float(value)
+            return raw
         for move in moves:
             result = solver.solve_arrays(masks, left, right, seat, pass_streak, pips, [move])
             value = int(result.value) if result.complete else 0
             raw[move] = value
             report.values[move] = report.values.get(move, 0.0) + float(value)
         return raw
+
+    def _score_net_leaf(self, state: GameState, moves: list[tuple[int, int]],
+                        view: PublicView, report: MoveReport, started: float) -> None:
+        """Score every move with the **network leaf** on the same worlds (depth 1).
+
+        Values are accumulated team-0 relative, like the compiled path, so ``act`` converts
+        them with the same sign logic. The worlds are drawn in two batches: a small probe to
+        measure the per-world cost, then as many as the remaining budget affords - the same
+        adapt-then-log discipline the compiled path uses.
+        """
+        leaf = self._net_leaf_for()
+        seat = int(state.turn)
+        target = self.worlds
+        probe = min(target, 4)
+        used = 0
+        per_world = 0.0
+        while used < target:
+            if used > 0:
+                elapsed = time.perf_counter() - started
+                if elapsed > self.time_budget:
+                    self._log_line(
+                        f"stopped after {used} world(s) of {target} "
+                        f"({elapsed:.3f}s > {self.time_budget:.3f}s)", report)
+                    break
+                affordable = int(max(1, self.time_budget / max(per_world, 1e-9)))
+                batch = min(target - used, max(1, affordable))
+            else:
+                batch = probe
+            mark = time.perf_counter()
+            worlds = self._draw(view, batch)
+            values = leaf.value_of_moves(state, seat, moves, worlds)
+            for move, value in values.items():
+                report.values[move] = report.values.get(move, 0.0) + float(value)
+            used += batch
+            per_world = (time.perf_counter() - started) / used
+        report.worlds_used = used
+        report.depth = 1
+
+    def _net_leaf_for(self) -> NetLeaf:
+        """The lazily built network leaf for this agent's ``leaf_eval`` mode."""
+        if self._net_leaf is None:
+            self._net_leaf = NetLeaf(self.model, mode=str(self.leaf_eval))
+        return self._net_leaf
 
     def _score_policy(self, state: GameState, moves: list[tuple[int, int]],
                       view: PublicView, depth: Optional[int], report: MoveReport,
@@ -274,11 +346,18 @@ class PIMCAgent:
         return self.horizon
 
     def _solver_for(self, depth: Optional[int]) -> Solver:
-        """Cache the solver per depth (its table is worth keeping between calls)."""
-        if self._solver is None or self._solver_depth != depth:
-            self._solver = Solver(max_depth=depth, leaf_eval=self.leaf_eval,
+        """Cache the solver per depth (its table is worth keeping between calls).
+
+        A *net* leaf mode picks the compiled path for the short-deal case: when ``depth`` is
+        ``None`` the decompiled solve runs to the terminal payoffs and never consults a leaf at
+        all, so the mode only has to be one the kernel accepts.
+        """
+        leaf = self.leaf_eval if self.leaf_eval in LEAF_MODES else "blocked_now"
+        if self._solver is None or self._solver_depth != depth or self._solver_leaf != leaf:
+            self._solver = Solver(max_depth=depth, leaf_eval=leaf,
                                   tt_bits=self.tt_bits, node_limit=self.node_limit)
             self._solver_depth = depth
+            self._solver_leaf = leaf
         return self._solver
 
 

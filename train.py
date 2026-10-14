@@ -323,6 +323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     from domino.league import EntropyFloorCallback
     from domino.policy import param_count
+    from domino.public_value import PublicValueHeadCallback
 
     runs_dir = RUNS_DIR / cfg.run_name
     results_dir = RESULTS_DIR
@@ -407,6 +408,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             print(f"Entropy floor: ent_coef >= {cfg.entropy_floor} while entropy < {cfg.min_entropy} nats")
+        if cfg.public_value_enabled:
+            callbacks.append(
+                PublicValueHeadCallback(
+                    coef=cfg.public_value_coef,
+                    lr=cfg.public_value_lr,
+                    batch_size=cfg.public_value_batch,
+                    every=cfg.public_value_every,
+                )
+            )
+            print(f"Aux public value head: coef={cfg.public_value_coef}, lr={cfg.public_value_lr}, "
+                  f"batch={cfg.public_value_batch}, every={cfg.public_value_every} "
+                  f"(the play-time value the search and the judge can use)")
 
         # Seed the league with an initial snapshot *before* training so the pool
         # always has at least one frozen opponent to sample from.

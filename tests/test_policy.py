@@ -224,10 +224,11 @@ def test_gradients_reach_every_submodule() -> None:
         assert param.grad is not None, f"{name} received no gradient"
         assert float(param.grad.abs().sum()) > 0.0, f"{name} received an all-zero gradient"
 
-    # Every parameter except the auxiliary belief head gets a PPO gradient: the
-    # belief head is trained by its own auxiliary loss (domino/belief.py).
+    # Every parameter except the auxiliary heads gets a PPO gradient: the belief head is
+    # trained by its own auxiliary loss (domino/belief.py) and the public value head by its
+    # own callback (domino/public_value.py), both of which own a separate optimiser.
     for name, param in policy.named_parameters():
-        if name.startswith("belief_head"):
+        if name.startswith("belief_head") or name.startswith("public_value_head"):
             continue
         assert param.grad is not None, f"{name} received no gradient"
 
@@ -241,6 +242,14 @@ def test_gradients_reach_every_submodule() -> None:
     belief_loss.backward()
     assert policy.belief_head.weight.grad is not None
     assert float(policy.belief_head.weight.grad.abs().sum()) > 0.0
+
+    # ... and the public value loss must reach the public value head and that same tower.
+    policy.zero_grad()
+    value_loss = th.nn.functional.mse_loss(policy.predict_public_values(obs_batch),
+                                           th.zeros((obs_batch.shape[0], 1)))
+    value_loss.backward()
+    assert policy.public_value_head.weight.grad is not None
+    assert float(policy.public_value_head.weight.grad.abs().sum()) > 0.0
     assert extractor.trunk[0].weight.grad is not None
     assert float(extractor.trunk[0].weight.grad.abs().sum()) > 0.0
 

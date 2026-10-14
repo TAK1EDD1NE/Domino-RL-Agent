@@ -328,7 +328,12 @@ class DominoMaskablePolicy(MaskableActorCriticPolicy):
             self.observation_space, features_dim=self.features_dim
         )
         self.belief_head = nn.Linear(self.features_dim, PRIVILEGED_DIM)
+        #: Public-information value head: the same 128 public features as the actor, the same
+        #: returns as the critic, but computable at play time (no privileged slice). Trained
+        #: by ``domino.public_value.PublicValueHeadCallback``, not by PPO's value loss.
+        self.public_value_head = nn.Linear(self.features_dim, 1)
         _orthogonal_init(self.belief_head)
+        _orthogonal_init(self.public_value_head)
         self._resync_optimizer()
 
     def _resync_optimizer(self) -> None:
@@ -357,6 +362,48 @@ class DominoMaskablePolicy(MaskableActorCriticPolicy):
             )
         features = self.pi_features_extractor(obs)
         return self.belief_head(features)
+
+    def predict_public_values(self, observations: th.Tensor) -> th.Tensor:
+        """Value of a position from the **public** features only, as ``(batch, 1)``.
+
+        This is the play-time value: the same 128 features the policy acts on, so unlike
+        :meth:`predict_values` (the centralised critic) it is computable without knowing the
+        hidden hands. Trained on PPO's own returns by the public-value callback; a fresh
+        checkpoint that predates the head returns the freshly initialised head's numbers
+        (near zero) rather than an error.
+
+        Same device handling as :meth:`predict_beliefs`.
+        """
+        if th.is_tensor(observations):
+            obs = observations.to(device=self.device, dtype=th.float32)
+        else:
+            obs = th.as_tensor(
+                np.asarray(observations), dtype=th.float32, device=self.device
+            )
+        return self.public_value_head(self.pi_features_extractor(obs))
+
+    def predict_action_logits(self, observations: th.Tensor,
+                              action_masks: Any | None = None) -> th.Tensor:
+        """Raw policy logits, optionally masked to legal moves.
+
+        The distillation path (:mod:`domino.distill`) needs the *distribution* the policy puts
+        on the legal moves, not a sampled action, and it must not depend on which action head
+        the architecture currently uses - this method is that single entry point. Masked-out
+        actions get the dtype's most negative value so a softmax ignores them.
+        """
+        if th.is_tensor(observations):
+            obs = observations.to(device=self.device, dtype=th.float32)
+        else:
+            obs = th.as_tensor(
+                np.asarray(observations), dtype=th.float32, device=self.device
+            )
+        logits = self.action_net(self.pi_features_extractor(obs))
+        if action_masks is None:
+            return logits
+        mask = th.as_tensor(np.asarray(action_masks), dtype=th.bool, device=logits.device)
+        if mask.shape != logits.shape:
+            raise ValueError(f"action_masks must be {tuple(logits.shape)}, got {tuple(mask.shape)}")
+        return logits.masked_fill(~mask, th.finfo(logits.dtype).min)
 
 
 def policy_kwargs_for(cfg: TrainConfig | None = None) -> dict[str, Any]:

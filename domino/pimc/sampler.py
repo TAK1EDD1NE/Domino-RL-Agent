@@ -49,6 +49,7 @@ from typing import Callable, Iterable, Optional, Sequence, Union
 import numpy as np
 
 from ..engine import GameState, TEAM_OF_SEAT
+from ..obs import OPPONENT_OFFSETS
 from ..tiles import ALL_TILE_IDS, NUM_TILES, tile_values
 
 #: Tiles per seat at the start of a deal.
@@ -68,6 +69,13 @@ class PublicView:
     ``played_by`` counts how many tiles each seat has played (public), and
     ``lacks[s]`` holds the pip values seat ``s`` is proven to be void in. ``ends`` is
     ``None`` for a free lead (empty board).
+
+    **Indexing warning**: every field here is indexed by **absolute** seat, and
+    :attr:`other_seats` / :attr:`counts` follow that order too - they are *not* in the
+    observation's ``[left, partner, right]`` order once the acting seat is not 0. Map with
+    ``zip(domino.obs.OPPONENT_OFFSETS, view.counts)`` when comparing against the network's
+    seat-relative blocks (a calibration test compared the two orders directly and read a
+    one-hand-size difference that was not there).
     """
 
     seat: int
@@ -169,8 +177,17 @@ class PublicView:
 
     @property
     def counts(self) -> tuple[int, int, int]:
-        """Remaining hand size of each other seat (public)."""
+        """Remaining hand size of each other seat (public), in **absolute** seat order."""
         return tuple(max(0, self.tiles_per_seat - self.played_by[s]) for s in self.other_seats)  # type: ignore[return-value]
+
+    def count_of(self, seat: int) -> int:
+        """Remaining hand size of one **absolute** seat (public)."""
+        return max(0, self.tiles_per_seat - self.played_by[int(seat)])
+
+    @property
+    def counts_relative(self) -> tuple[int, int, int]:
+        """Remaining hand sizes in the observation's ``[left, partner, right]`` order."""
+        return tuple(self.count_of((self.seat + offset) % 4) for offset in OPPONENT_OFFSETS)  # type: ignore[return-value]
 
     @property
     def unseen(self) -> tuple[int, ...]:
@@ -387,9 +404,22 @@ def sample_worlds(view: PublicView, n: int, rng: np.random.Generator, *,
 
 
 def enumerate_worlds(view: PublicView) -> list[World]:
-    """Every valid world, each once (the exact support; small positions only)."""
+    """Every valid world, each once (the exact support; small positions only).
+
+    Raises :class:`ValueError` when the view is unsatisfiable (``counts`` do not match the
+    unseen pool). ``sample_worlds`` checks this too, but a raw enumeration without the check
+    is a combinatorial memory bomb: a view built with the wrong ``tiles_per_seat`` asked for
+    hands of seven from a six-tile pool and allocated until the machine swapped.
+    """
     from itertools import combinations
 
+    count_total = sum(view.counts)
+    unseen_total = len(view.unseen)
+    if count_total != unseen_total:
+        raise ValueError(
+            f"unsatisfiable view: {unseen_total} unseen tile(s) do not match the public "
+            f"counts {view.counts} (sum {count_total}); is tiles_per_seat={view.tiles_per_seat} right?"
+        )
     seats = view.other_seats
     counts = view.counts
     pool = list(view.unseen)

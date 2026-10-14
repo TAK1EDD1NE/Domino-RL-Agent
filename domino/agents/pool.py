@@ -50,10 +50,61 @@ KNOWN_SOURCES: frozenset[str] = frozenset(DEFAULT_WEIGHTS)
 
 
 def load_policy(path: str) -> Any:
-    """Load a frozen snapshot checkpoint (sb3 imported lazily on first use)."""
+    """Load a frozen snapshot checkpoint, tolerating heads added after it was written.
+
+    The policy class grows heads over time (the belief head, then the public value head), and
+    ``MaskablePPO.load`` uses ``exact_match=True``, so a strict load makes *every* older
+    checkpoint unloadable - including the ones ``test.py``, ``play.py``, the evaluation harness
+    and the league all load. The fallback below builds a fresh policy of the current class and
+    copies the saved weights into it with ``strict=False``, reporting exactly which parameters
+    were left at their initialisation, so the gap is visible instead of a crash or a silent
+    wrong number.
+    """
     from sb3_contrib import MaskablePPO
 
-    return MaskablePPO.load(path)
+    try:
+        return MaskablePPO.load(path)
+    except RuntimeError as error:
+        message = str(error)
+        if "Missing key(s)" not in message and "Unexpected key(s)" not in message:
+            raise
+        return _load_policy_tolerant(path)
+
+
+def _load_policy_tolerant(path: str) -> Any:
+    """Build a current-architecture model and copy in whatever the checkpoint has."""
+    import io
+    import warnings
+    import zipfile
+
+    import torch as th
+    from sb3_contrib import MaskablePPO
+
+    from ..config import TrainConfig
+    from ..env import DominoEnv
+    from ..policy import DominoMaskablePolicy, policy_kwargs_for
+    from .random_agent import RandomAgent
+
+    with zipfile.ZipFile(path) as archive:
+        raw = archive.read("policy.pth")
+    state = th.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
+    model = MaskablePPO(
+        DominoMaskablePolicy,
+        DominoEnv(opponent=RandomAgent(seed=0), seed=0),
+        policy_kwargs=policy_kwargs_for(TrainConfig()),
+        device="cpu",
+    )
+    missing, unexpected = model.policy.load_state_dict(state, strict=False)
+    if missing:
+        warnings.warn(
+            f"{path}: {len(missing)} parameter tensor(s) not present in the checkpoint and "
+            f"left at their initialisation: {sorted(missing)}", RuntimeWarning, stacklevel=2)
+    if unexpected:
+        warnings.warn(
+            f"{path}: {len(unexpected)} parameter tensor(s) in the checkpoint are not in the "
+            f"current policy and were dropped: {sorted(unexpected)}", RuntimeWarning, stacklevel=2)
+
+    return model
 
 
 def _normalised_weights(weights: dict[str, float] | None) -> dict[str, float]:
