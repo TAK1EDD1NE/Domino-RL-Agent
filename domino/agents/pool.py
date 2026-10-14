@@ -49,29 +49,42 @@ DEFAULT_WEIGHTS: dict[str, float] = {"self": 0.5, "snapshot": 0.2, "rule": 0.2, 
 KNOWN_SOURCES: frozenset[str] = frozenset(DEFAULT_WEIGHTS)
 
 
-def load_policy(path: str) -> Any:
+def load_policy(path: str, *, env: Any = None, device: str | None = None,
+                tensorboard_log: str | None = None) -> Any:
     """Load a frozen snapshot checkpoint, tolerating heads added after it was written.
 
     The policy class grows heads over time (the belief head, then the public value head), and
     ``MaskablePPO.load`` uses ``exact_match=True``, so a strict load makes *every* older
-    checkpoint unloadable - including the ones ``test.py``, ``play.py``, the evaluation harness
-    and the league all load. The fallback below builds a fresh policy of the current class and
-    copies the saved weights into it with ``strict=False``, reporting exactly which parameters
-    were left at their initialisation, so the gap is visible instead of a crash or a silent
-    wrong number.
+    checkpoint unloadable - including the ones ``test.py``, ``play.py``, the evaluation harness,
+    the league and the trainer's own ``--resume`` load. The fallback below builds a fresh policy
+    of the current class and copies the saved weights into it with ``strict=False``, reporting
+    exactly which parameters were left at their initialisation, so the gap is visible instead of
+    a crash or a silent wrong number.
+
+    ``env`` / ``device`` / ``tensorboard_log`` are forwarded to sb3's own loader *and* to the
+    fallback, so the trainer resumes through the same entry point the evaluation tools use.
     """
     from sb3_contrib import MaskablePPO
 
+    forwarded: dict[str, Any] = {}
+    if env is not None:
+        forwarded["env"] = env
+    if device is not None:
+        forwarded["device"] = device
+    if tensorboard_log is not None:
+        forwarded["tensorboard_log"] = tensorboard_log
     try:
-        return MaskablePPO.load(path)
+        return MaskablePPO.load(path, **forwarded)
     except RuntimeError as error:
         message = str(error)
         if "Missing key(s)" not in message and "Unexpected key(s)" not in message:
             raise
-        return _load_policy_tolerant(path)
+        return _load_policy_tolerant(path, env=env, device=device,
+                                     tensorboard_log=tensorboard_log)
 
 
-def _load_policy_tolerant(path: str) -> Any:
+def _load_policy_tolerant(path: str, *, env: Any = None, device: str | None = None,
+                          tensorboard_log: str | None = None) -> Any:
     """Build a current-architecture model and copy in whatever the checkpoint has."""
     import io
     import warnings
@@ -87,14 +100,59 @@ def _load_policy_tolerant(path: str) -> Any:
 
     with zipfile.ZipFile(path) as archive:
         raw = archive.read("policy.pth")
+        try:
+            import json
+
+            # sb3 2.x writes the metadata as JSON (it was a pickle in 1.x), so try JSON first
+            # and keep the pickle fallback for older files. A silent failure here would restart
+            # the training clock, which is exactly the bug this block exists to prevent.
+            data = json.loads(archive.read("data").decode("utf-8"))
+        except Exception:
+            try:
+                import pickle
+
+                data = pickle.loads(archive.read("data"))
+            except Exception as error:                        # pragma: no cover - odd checkpoint
+                warnings.warn(
+                    f"{path}: could not read the saved metadata ({error}); a resumed run will "
+                    f"restart its step counter and learning-rate schedule from zero",
+                    RuntimeWarning, stacklevel=2)
+                data = {}
+        optimizer_raw = None
+        if "policy.optimizer.pth" in archive.namelist():
+            optimizer_raw = archive.read("policy.optimizer.pth")
     state = th.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
+    if env is None:
+        # Only for evaluation: a throwaway environment carrying the right spaces. The trainer
+        # passes its own vector env, because a model must be bound to the env it will train in.
+        env = DominoEnv(opponent=RandomAgent(seed=0), seed=0)
+    extra: dict[str, Any] = {}
+    if tensorboard_log is not None:
+        extra["tensorboard_log"] = tensorboard_log
     model = MaskablePPO(
         DominoMaskablePolicy,
-        DominoEnv(opponent=RandomAgent(seed=0), seed=0),
+        env,
         policy_kwargs=policy_kwargs_for(TrainConfig()),
-        device="cpu",
+        device=device or "cpu",
+        **extra,
     )
     missing, unexpected = model.policy.load_state_dict(state, strict=False)
+    # A tolerant load must not silently restart the training clock: sb3's own load restores
+    # num_timesteps (and the LR schedule reads it), so without this a resumed run restarts at
+    # step 0 and rewrites the run's step-numbered checkpoints under the old names.
+    if isinstance(data, dict):
+        if data.get("num_timesteps") is not None:
+            model.num_timesteps = int(data["num_timesteps"])
+        if data.get("_total_timesteps") is not None:
+            model._total_timesteps = int(data["_total_timesteps"])
+    if optimizer_raw is not None:
+        try:
+            model.policy.optimizer.load_state_dict(
+                th.load(io.BytesIO(optimizer_raw), map_location="cpu", weights_only=False))
+        except (ValueError, KeyError, RuntimeError) as error:
+            warnings.warn(
+                f"{path}: the saved optimiser state could not be restored ({error}); the "
+                f"resumed run starts with fresh Adam moments", RuntimeWarning, stacklevel=2)
     if missing:
         warnings.warn(
             f"{path}: {len(missing)} parameter tensor(s) not present in the checkpoint and "

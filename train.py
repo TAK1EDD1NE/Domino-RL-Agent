@@ -353,9 +353,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         latest = checkpoint_dir / "latest.zip"
         if resume and latest.exists():
             print(f"Resuming from {latest}")
-            model = MaskablePPO.load(
-                str(latest), env=vec_env, device=cfg.device, tensorboard_log=str(runs_dir)
-            )
+            # Through the lenient loader: sb3's own load is exact_match=True, so resuming a
+            # checkpoint written before a head existed (the public value head, say) would abort
+            # the whole run with a missing-key error.
+            from domino.agents.pool import load_policy
+
+            model = load_policy(str(latest), env=vec_env, device=cfg.device,
+                                tensorboard_log=str(runs_dir))
         else:
             if resume:
                 print(f"--resume requested but {latest} does not exist; starting fresh")

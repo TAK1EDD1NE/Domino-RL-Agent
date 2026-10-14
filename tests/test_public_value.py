@@ -161,6 +161,38 @@ def test_older_checkpoints_still_load_with_the_new_head() -> None:
     assert th.allclose(loaded, saved["action_net.weight"].to(loaded.device), atol=1e-6)
 
 
+def test_lenient_loader_binds_the_env_the_trainer_passes() -> None:
+    """``--resume`` goes through this loader, so the model must be bound to the trainer's env.
+
+    A tolerant load that silently attached its own throwaway environment would train the
+    resumed policy against the wrong env object (the spaces happen to match, so nothing would
+    raise).
+    """
+    import pathlib
+    import warnings
+
+    from domino.agents.pool import load_policy
+    from domino.env import DominoEnv
+
+    path = pathlib.Path("models/checkpoints/ppo_16002774_steps.zip")
+    if not path.exists():
+        pytest.skip("the trained checkpoint is not present in this working tree")
+    env = DominoEnv(opponent=RandomAgent(seed=0), seed=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = load_policy(str(path), env=env, device="cpu")
+    # sb3 wraps a bare env (DummyVecEnv, then Monitor); the point is that *this* env is what
+    # the model ends up holding.
+    node: Any = model.env
+    for _ in range(6):
+        if node is env:
+            break
+        node = node.envs[0] if hasattr(node, "envs") else getattr(node, "env", None)
+        if node is None:
+            break
+    assert node is env, f"the loader attached {type(model.env).__name__}, not the trainer's env"
+
+
 def test_checkpoint_round_trip_keeps_the_head() -> None:
     """Save/load must carry the new head, or evaluation silently uses a random one."""
     model = _model()
