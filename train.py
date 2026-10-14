@@ -323,6 +323,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     from domino.league import EntropyFloorCallback
     from domino.policy import param_count
+    from domino.progress import PeriodicEvalCallback
     from domino.public_value import PublicValueHeadCallback
 
     runs_dir = RUNS_DIR / cfg.run_name
@@ -424,6 +425,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Aux public value head: coef={cfg.public_value_coef}, lr={cfg.public_value_lr}, "
                   f"batch={cfg.public_value_batch}, every={cfg.public_value_every} "
                   f"(the play-time value the search and the judge can use)")
+
+        if cfg.progress_eval_enabled:
+            callbacks.append(
+                PeriodicEvalCallback(
+                    cfg.run_name,
+                    results_dir=results_dir,
+                    every=cfg.progress_eval_every,
+                    deals=cfg.progress_eval_deals,
+                    anchor_path=cfg.progress_anchor_path or None,
+                    stats=stats_cb,
+                    stop_on_broken=cfg.progress_stop_on_broken,
+                    broken_patience=cfg.progress_broken_patience,
+                )
+            )
+            stop_text = (
+                f"a broken run stops after {cfg.progress_broken_patience} consecutive BROKEN "
+                "readings" if cfg.progress_stop_on_broken else "stop_on_broken is off"
+            )
+            print(
+                f"Progress gate: the LIVE policy is evaluated against fixed anchors every "
+                f"{cfg.progress_eval_every:,} steps ({cfg.progress_eval_deals} duplicate pairs "
+                f"each) -> results/progress_{cfg.run_name}.csv; {stop_text}"
+            )
 
         # Seed the league with an initial snapshot *before* training so the pool
         # always has at least one frozen opponent to sample from.

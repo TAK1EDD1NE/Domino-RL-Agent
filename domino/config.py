@@ -88,6 +88,19 @@ class TrainConfig:
     public_value_every: int = 8
     #: PIMC determinisations at inference (item 5); 0 disables search.
     search_k: int = 0
+    # ---- in-training progress gate (domino/progress.py) -------------------------
+    #: Evaluate the LIVE policy against fixed anchors (rule bot / random / this run's own
+    #: earliest snapshot) while training, so strength is visible before the run ends.
+    progress_eval_enabled: bool = True
+    progress_eval_every: int = 250_000     # steps between evaluations (~5 min at 800 steps/s)
+    progress_eval_deals: int = 200         # duplicate pairs per anchor (each pair = 2 games)
+    #: Explicit checkpoint for the ``anchor`` leg. Empty = resolve this run's earliest league
+    #: snapshot (the policy the run started from), which is the leg that measures progress.
+    progress_anchor_path: str = ""
+    #: Halt after ``progress_broken_patience`` consecutive BROKEN readings (frozen deals or an
+    #: entropy collapse with no gradient signal). A stall only prints NO-GAIN and never stops.
+    progress_stop_on_broken: bool = True
+    progress_broken_patience: int = 2
 
 
 @dataclass
